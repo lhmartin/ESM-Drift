@@ -209,3 +209,6 @@ CLAUDE.md
 docs/architecture.md
 docs/training_notes.md
 data/*.pt
+checkpoints/*
+output/*
+wandb/*
