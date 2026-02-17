@@ -208,3 +208,4 @@ __marimo__/
 CLAUDE.md
 docs/architecture.md
 docs/training_notes.md
+data/*.pt
