@@ -155,6 +155,31 @@ def fast_residue_count(pdb_bytes: bytes) -> int:
     return len(seen)
 
 
+def _manifest_path(tarball_path: Path, pdb_dir: Path) -> Path:
+    """Path to the manifest file for a processed tarball."""
+    return pdb_dir / f".{tarball_path.stem.replace('.tar', '')}.manifest.tsv"
+
+
+def _load_manifest(manifest: Path, pdb_dir: Path) -> list[tuple[str, str, Path]]:
+    """Load a previously-saved tarball manifest."""
+    proteins = []
+    for line in manifest.read_text().splitlines():
+        if not line.strip():
+            continue
+        protein_id, seq, pdb_name = line.split("\t")
+        proteins.append((protein_id, seq, pdb_dir / pdb_name))
+    return proteins
+
+
+def _save_manifest(
+    manifest: Path, proteins: list[tuple[str, str, Path]]
+) -> None:
+    """Save a tarball manifest (protein_id, sequence, pdb filename)."""
+    with open(manifest, "w") as f:
+        for protein_id, seq, pdb_path in proteins:
+            f.write(f"{protein_id}\t{seq}\t{pdb_path.name}\n")
+
+
 def extract_pdbs_from_tarball(
     tarball_path: Path,
     pdb_dir: Path,
@@ -164,6 +189,10 @@ def extract_pdbs_from_tarball(
     existing_count: int = 0,
 ) -> list[tuple[str, str, Path]]:
     """Extract PDB files from a tarball, filtering by sequence length.
+
+    If a manifest exists from a previous complete run, loads from that instead
+    of re-reading the tarball. Manifests are only written when the full tarball
+    is processed (not when stopped early by max_proteins).
 
     Args:
         tarball_path: Path to downloaded .tar.gz file.
@@ -177,15 +206,31 @@ def extract_pdbs_from_tarball(
         List of (protein_id, sequence, pdb_path) tuples for extracted proteins.
     """
     pdb_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check for existing manifest from a previous complete run
+    manifest = _manifest_path(tarball_path, pdb_dir)
+    if manifest.exists():
+        all_proteins = _load_manifest(manifest, pdb_dir)
+        if max_proteins:
+            remaining = max_proteins - existing_count
+            all_proteins = all_proteins[:remaining]
+        log.info(
+            "Loaded %d proteins from manifest for %s (skipping tarball)",
+            len(all_proteins), tarball_path.name,
+        )
+        return all_proteins
+
     extracted = []
     skipped = 0
     count = existing_count
+    hit_limit = False
 
     log.info("Processing tarball: %s", tarball_path.name)
 
     with tarfile.open(tarball_path, "r:gz") as tar:
         for member in tar:
             if max_proteins and count >= max_proteins:
+                hit_limit = True
                 break
 
             if not member.name.endswith(".pdb.gz"):
@@ -238,6 +283,12 @@ def extract_pdbs_from_tarball(
         "Tarball %s: extracted %d proteins, skipped %d",
         tarball_path.name, len(extracted), skipped,
     )
+
+    # Only save manifest if we processed the entire tarball (not truncated by max_proteins)
+    if not hit_limit:
+        _save_manifest(manifest, extracted)
+        log.info("Saved manifest for %s (%d proteins)", tarball_path.name, len(extracted))
+
     return extracted
 
 
@@ -246,10 +297,13 @@ def run_embedding_extraction(
     output_dir: Path,
     device: str = "cuda",
     max_seq_len: int = 1024,
+    batch_size: int = 1,
+    compile_model: bool = False,
 ) -> int:
     """Run ESMFold embedding extraction on filtered PDB files.
 
-    Uses the existing EmbeddingExtractor from the project.
+    Uses batched extraction for throughput. Proteins are sorted by sequence
+    length to minimize padding waste within each batch.
 
     Returns:
         Number of successfully extracted embeddings.
@@ -257,31 +311,56 @@ def run_embedding_extraction(
     from esm_drift.data.extract import EmbeddingExtractor
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    extractor = EmbeddingExtractor(device=device, max_seq_len=max_seq_len)
-    success = 0
+    extractor = EmbeddingExtractor(
+        device=device, max_seq_len=max_seq_len, compile_model=compile_model,
+    )
 
-    for i, (protein_id, sequence, pdb_path) in enumerate(proteins):
+    # Filter out already-extracted, then sort by length for batching efficiency
+    todo = []
+    skipped = 0
+    for protein_id, sequence, pdb_path in proteins:
         out_path = output_dir / f"{protein_id}.pt"
         if out_path.exists():
-            log.info("Skipping %s (already extracted)", protein_id)
-            success += 1
+            skipped += 1
             continue
+        todo.append((protein_id, sequence, pdb_path, out_path))
+
+    if skipped:
+        log.info("Skipping %d already-extracted embeddings", skipped)
+
+    todo.sort(key=lambda t: len(t[1]))
+    success = 0
+
+    for batch_start in range(0, len(todo), batch_size):
+        batch = todo[batch_start : batch_start + batch_size]
+        seqs = [t[1] for t in batch]
 
         try:
-            extractor.extract_and_save(
-                sequence=sequence,
-                output_path=out_path,
-                source_file=str(pdb_path),
-                chain_id="A",
-            )
+            results = extractor.extract_batch(seqs)
+        except RuntimeError as e:
+            log.error("Batch failed (size=%d, max_L=%d): %s. Try reducing --batch_size",
+                      len(seqs), max(len(s) for s in seqs), e)
+            continue
+
+        for (protein_id, sequence, pdb_path, out_path), result in zip(batch, results):
+            data = {
+                "s_s": result["s_s"],
+                "s_z": result["s_z"],
+                "sequence": sequence,
+                "source_file": str(pdb_path),
+                "chain_id": "A",
+                "plddt": result["plddt"],
+                "ptm": result["ptm"],
+                "seq_len": len(sequence),
+            }
+            torch.save(data, out_path)
             success += 1
-        except Exception as e:
-            log.error("Failed to extract %s: %s", protein_id, e)
 
-        if (i + 1) % 50 == 0:
-            log.info("Extraction progress: %d/%d (success=%d)", i + 1, len(proteins), success)
+        done = batch_start + len(batch)
+        if done % 100 < batch_size or done == len(todo):
+            log.info("Extraction progress: %d/%d (success=%d)", done, len(todo), success)
 
-    return success
+    return success + skipped
 
 
 def main():
@@ -300,6 +379,10 @@ def main():
                         help="Maximum number of proteins to extract")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device for ESMFold extraction")
+    parser.add_argument("--batch_size", type=int, default=1,
+                        help="Sequences per GPU batch (default: 1). Memory scales as batch * L^2.")
+    parser.add_argument("--compile", action="store_true",
+                        help="Compile ESMFold with torch.compile for faster repeated inference")
     parser.add_argument("--skip_extraction", action="store_true",
                         help="Only download and filter PDBs, skip ESMFold extraction")
     parser.add_argument("--skip_download", action="store_true",
@@ -350,6 +433,8 @@ def main():
             all_proteins, output_dir,
             device=args.device,
             max_seq_len=args.max_seq_len,
+            batch_size=args.batch_size,
+            compile_model=args.compile,
         )
         log.info("Extraction complete: %d/%d successful", n_success, len(all_proteins))
     else:

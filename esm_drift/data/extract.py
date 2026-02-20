@@ -110,15 +110,30 @@ def sequence_from_structure(filepath: Path, chain_id: str | None = None) -> list
     return results
 
 
+def collect_sequences_from_file(
+    filepath: Path,
+    chain_id: str | None = None,
+    max_seq_len: int = 1024,
+) -> list[tuple[str, str]]:
+    """Parse a PDB/mmCIF file and return (chain_id, sequence) pairs.
+
+    Handles .gz compression automatically. Sequences exceeding max_seq_len are truncated.
+    """
+    with _maybe_decompress(filepath) as actual_path:
+        chains = sequence_from_structure(actual_path, chain_id=chain_id)
+    return [(cid, seq[:max_seq_len]) for cid, seq in chains]
+
+
 class EmbeddingExtractor:
     """Extracts ESMFold intermediate representations from protein sequences.
 
     Loads ESMFold once and reuses it across many proteins.
     """
 
-    def __init__(self, device: str = "cuda", max_seq_len: int = 1024):
+    def __init__(self, device: str = "cuda", max_seq_len: int = 1024, compile_model: bool = False):
         self.device = torch.device(device)
         self.max_seq_len = max_seq_len
+        self._compile_model = compile_model
         self._model = None
         self._tokenizer = None
 
@@ -136,48 +151,64 @@ class EmbeddingExtractor:
         self._model.eval()
         log.info("ESMFold loaded on %s", self.device)
 
+        if self._compile_model:
+            log.info("Compiling ESMFold with torch.compile (first inference call will be slow)...")
+            try:
+                self._model = torch.compile(self._model, mode="default", dynamic=True)
+                log.info("torch.compile succeeded")
+            except Exception as e:
+                log.warning("torch.compile failed (%s), continuing without compilation", e)
+
     @torch.no_grad()
-    def extract(self, sequence: str) -> dict:
-        """Run ESMFold on a sequence and return intermediate embeddings.
+    def extract_batch(self, sequences: list[str]) -> list[dict]:
+        """Run ESMFold on a batch of sequences.
 
-        Args:
-            sequence: Amino acid sequence (single-letter codes).
-
-        Returns:
-            Dict with keys: s_s, s_z, plddt, ptm, positions
+        Sequences are padded to the longest in the batch. Returns one result dict
+        per sequence with keys: s_s [L, 1024], s_z [L, L, 128], plddt [L], ptm.
         """
         self._load_model()
 
-        if len(sequence) > self.max_seq_len:
-            log.warning(
-                "Sequence length %d exceeds max %d, truncating",
-                len(sequence), self.max_seq_len,
-            )
-            sequence = sequence[:self.max_seq_len]
+        truncated = []
+        for seq in sequences:
+            if len(seq) > self.max_seq_len:
+                log.warning("Sequence length %d exceeds max %d, truncating", len(seq), self.max_seq_len)
+                truncated.append(seq[:self.max_seq_len])
+            else:
+                truncated.append(seq)
+        sequences = truncated
 
         inputs = self._tokenizer(
-            [sequence], return_tensors="pt", add_special_tokens=False
+            sequences, return_tensors="pt", add_special_tokens=False, padding=True
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         with torch.autocast(device_type=self.device.type, dtype=torch.float16):
             outputs = self._model(**inputs)
 
-        # s_s: single representation [1, L, 1024]
-        s_s = outputs.s_s[0].cpu()  # [L, 1024]
-        # s_z: pair representation [1, L, L, 128]
-        s_z = outputs.s_z[0].cpu()  # [L, L, 128]
-        # plddt: per-residue confidence [1, L, 1]
-        plddt = outputs.plddt[0, :, 0].cpu()  # [L]
-        # ptm: overall structure confidence
-        ptm = outputs.ptm.item()
+        results = []
+        for i, seq in enumerate(sequences):
+            L = len(seq)
+            s_s = outputs.s_s[i, :L].cpu()        # [L, 1024]
+            s_z = outputs.s_z[i, :L, :L].cpu()    # [L, L, 128]
+            plddt = outputs.plddt[i, :L, 0].cpu() # [L]
+            # ptm shape varies: scalar when batch=1, [B] otherwise
+            ptm_t = outputs.ptm
+            ptm = ptm_t[i].item() if ptm_t.dim() > 0 and ptm_t.shape[0] > 1 else ptm_t.item()
+            results.append({"s_s": s_s, "s_z": s_z, "plddt": plddt, "ptm": ptm})
 
-        return {
-            "s_s": s_s,
-            "s_z": s_z,
-            "plddt": plddt,
-            "ptm": ptm,
-        }
+        return results
+
+    @torch.no_grad()
+    def extract(self, sequence: str) -> dict:
+        """Run ESMFold on a single sequence and return intermediate embeddings.
+
+        Args:
+            sequence: Amino acid sequence (single-letter codes).
+
+        Returns:
+            Dict with keys: s_s [L, 1024], s_z [L, L, 128], plddt [L], ptm
+        """
+        return self.extract_batch([sequence])[0]
 
     def extract_and_save(
         self,
