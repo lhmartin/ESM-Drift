@@ -1,4 +1,4 @@
-"""Generator and feature encoder for the drifting method."""
+"""Generator and sequence head for the drifting method."""
 
 import math
 
@@ -6,61 +6,45 @@ import torch
 import torch.nn as nn
 
 
-class FeatureEncoder(nn.Module):
-    """Projects per-residue s_s embeddings to a fixed-size feature vector.
+class DriftingGeneratorUNet(nn.Module):
+    """U-Net generator: noise [B, L, d_noise] → s_s [B, L, 1024].
 
-    Used to compute the kernel in the drifting field. Should be pretrained
-    (e.g., reconstruction objective) and frozen during drifting training.
+    The U-Net principle is applied to the feature dimension (not spatial
+    resolution): per-residue features are compressed stage-by-stage in the
+    encoder and expanded back with skip connections in the decoder.
+    Sequence length L is unchanged throughout.
 
-    Architecture: per-residue MLP → masked mean pool → projection.
-    """
+        noise [B, L, d_noise]
+          → input_proj + pos_enc  → [B, L, d_model]
+          ┌──────────────────────────────────────────────────────────────┐
+          │  Enc-1: Transformer (enc1_layers)   [B, L, d_model]         │── skip1
+          │  down1: Linear + LN                 [B, L, d_mid]           │
+          │  Enc-2: Transformer (enc2_layers)   [B, L, d_mid]           │── skip2
+          │  down2: Linear + LN                 [B, L, d_bottleneck]    │
+          │  Bottleneck: Transformer (1 layer)  [B, L, d_bottleneck]    │
+          │  up2:   Linear                      [B, L, d_mid]           │
+          │  merge2: cat(up2, skip2) → Linear   [B, L, d_mid]           │
+          │  Dec-2: Transformer (dec2_layers)   [B, L, d_mid]           │
+          │  up1:   Linear                      [B, L, d_model]         │
+          │  merge1: cat(up1, skip1) → Linear   [B, L, d_model]         │
+          │  Dec-1: Transformer (dec1_layers)   [B, L, d_model]         │
+          └──────────────────────────────────────────────────────────────┘
+          → output_norm → s_s_head → [B, L, s_s_dim]
+          → + noise_skip (per-position diversity)
+          → × output_scale (learnable)
 
-    def __init__(self, input_dim: int = 1024, hidden_dim: int = 512, output_dim: int = 256):
-        super().__init__()
-        self.per_residue = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.project = nn.Sequential(
-            nn.GELU(),
-            nn.Linear(hidden_dim, output_dim),
-            nn.LayerNorm(output_dim),  # keeps feature norms ~sqrt(output_dim)
-        )
-
-    def forward(self, s_s: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            s_s: [B, L, input_dim] single representations
-            mask: [B, L] boolean, True = valid residue
-
-        Returns:
-            [B, output_dim] pooled feature vectors
-        """
-        h = self.per_residue(s_s)  # [B, L, hidden_dim]
-        # Masked mean pool
-        h = h * mask.unsqueeze(-1).float()
-        h = h.sum(dim=1) / mask.sum(dim=1, keepdim=True).float().clamp(min=1)
-        return self.project(h)  # [B, output_dim]
-
-
-class DriftingGenerator(nn.Module):
-    """Transformer that maps noise to s_s embeddings.
-
-    Input: Gaussian noise [B, L, d_noise]
-    Output: s_s [B, L, s_s_dim]
-
-    Uses a standard Transformer encoder with sinusoidal positional encoding.
-    The mask ensures padded positions output zeros.
+    d_mid is automatically computed as the midpoint between d_model and
+    d_bottleneck, rounded up to the nearest multiple of nhead.
     """
 
     def __init__(
         self,
         d_noise: int = 256,
-        d_model: int = 256,
+        d_model: int = 512,
+        d_bottleneck: int = 128,
         nhead: int = 8,
-        num_layers: int = 4,
-        dim_feedforward: int = 1024,
+        enc_layers: int = 3,
+        dec_layers: int = 3,
         s_s_dim: int = 1024,
         dropout: float = 0.0,
         max_len: int = 512,
@@ -68,61 +52,120 @@ class DriftingGenerator(nn.Module):
         super().__init__()
         self.d_noise = d_noise
         self.d_model = d_model
+        self.d_bottleneck = d_bottleneck
+        self.nhead = nhead
+        self.enc_layers = enc_layers
+        self.dec_layers = dec_layers
+        self.num_layers = enc_layers + dec_layers
+
+        # Intermediate dimension: midpoint rounded up to nhead multiple
+        d_mid = (d_model + d_bottleneck + 1) // 2
+        d_mid = ((d_mid + nhead - 1) // nhead) * nhead
+        self.d_mid = d_mid
+
+        # Split enc/dec layers evenly between the two stages
+        enc1_layers = max(1, enc_layers - enc_layers // 2)
+        enc2_layers = max(1, enc_layers // 2)
+        dec2_layers = max(1, dec_layers - dec_layers // 2)
+        dec1_layers = max(1, dec_layers // 2)
+
+        def _nhead_for(d: int) -> int:
+            """Largest power of 2 ≤ nhead that evenly divides d."""
+            n = nhead
+            while n > 1 and d % n != 0:
+                n //= 2
+            return max(1, n)
+
+        def _transformer(d: int, n: int) -> nn.TransformerEncoder:
+            layer = nn.TransformerEncoderLayer(
+                d_model=d, nhead=_nhead_for(d), dim_feedforward=d * 4,
+                dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
+            )
+            return nn.TransformerEncoder(layer, num_layers=n)
 
         self.input_proj = nn.Linear(d_noise, d_model)
         self.pos_enc = SinusoidalPositionalEncoding(d_model, max_len)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # Encoder: d_model → d_mid → d_bottleneck
+        self.enc1 = _transformer(d_model, enc1_layers)
+        self.down1 = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, d_mid))
+        self.enc2 = _transformer(d_mid, enc2_layers)
+        self.down2 = nn.Sequential(nn.LayerNorm(d_mid), nn.Linear(d_mid, d_bottleneck))
+
+        # Bottleneck: single Transformer at the compressed dimension
+        self.bottleneck = _transformer(d_bottleneck, 1)
+
+        # Decoder: d_bottleneck → d_mid → d_model (each with skip connection)
+        self.up2       = nn.Linear(d_bottleneck, d_mid)
+        self.merge2    = nn.Sequential(nn.Linear(d_mid * 2, d_mid), nn.LayerNorm(d_mid))
+        self.dec2      = _transformer(d_mid, dec2_layers)
+
+        self.up1       = nn.Linear(d_mid, d_model)
+        self.merge1    = nn.Sequential(nn.Linear(d_model * 2, d_model), nn.LayerNorm(d_model))
+        self.dec1      = _transformer(d_model, dec1_layers)
+
         self.output_norm = nn.LayerNorm(d_model)
-        self.s_s_head = nn.Linear(d_model, s_s_dim)
+        self.s_s_head    = nn.Linear(d_model, s_s_dim)
 
-        # Skip connection: noise → output, ensuring per-position diversity
-        # even if the Transformer averages positions via self-attention
-        self.noise_skip = nn.Linear(d_noise, s_s_dim, bias=False)
-
-        # Learnable output scale — default Linear init gives output norm ~2,
-        # but ESMFold s_s has norms ~4000. This scalar closes the gap.
+        self.noise_skip  = nn.Linear(d_noise, s_s_dim, bias=False)
         self.output_scale = nn.Parameter(torch.tensor(10.0))
 
     def forward(self, noise: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            noise: [B, L, d_noise] sampled from N(0, I)
-            mask: [B, L] boolean, True = valid residue
-
+            noise: [B, L, d_noise]
+            mask:  [B, L] boolean, True = valid residue
         Returns:
-            s_s: [B, L, s_s_dim] generated single representations
+            s_s: [B, L, s_s_dim]
         """
-        h = self.input_proj(noise)  # [B, L, d_model]
-        h = h + self.pos_enc(h)
+        pad_mask = ~mask  # Transformer convention: True = ignore
 
-        # Transformer expects mask where True = IGNORE
-        h = self.transformer(h, src_key_padding_mask=~mask)
-        h = self.output_norm(h)
-        s_s = self.s_s_head(h)  # [B, L, s_s_dim]
+        h = self.input_proj(noise) + self.pos_enc(noise)  # [B, L, d_model]
 
-        # Add noise skip connection for per-position diversity
+        # Encoder — compress feature dimension stage by stage
+        e1 = self.enc1(h,          src_key_padding_mask=pad_mask)  # [B, L, d_model]  ← skip1
+        e2 = self.enc2(self.down1(e1), src_key_padding_mask=pad_mask)  # [B, L, d_mid]  ← skip2
+        z  = self.bottleneck(self.down2(e2), src_key_padding_mask=pad_mask)  # [B, L, d_bottleneck]
+
+        # Decoder — expand back with skip connections
+        d2 = self.merge2(torch.cat([self.up2(z),  e2], dim=-1))  # [B, L, d_mid]
+        d2 = self.dec2(d2, src_key_padding_mask=pad_mask)
+
+        d1 = self.merge1(torch.cat([self.up1(d2), e1], dim=-1))  # [B, L, d_model]
+        d1 = self.dec1(d1, src_key_padding_mask=pad_mask)
+        d1 = self.output_norm(d1)
+
+        s_s = self.s_s_head(d1)
         s_s = s_s + self.noise_skip(noise)
-
-        # Learnable scale
         s_s = s_s * self.output_scale
-
-        # Zero out padded positions
         s_s = s_s * mask.unsqueeze(-1).float()
         return s_s
 
     def sample_noise(self, batch_size: int, seq_len: int, device: torch.device) -> torch.Tensor:
-        """Sample input noise from N(0, I)."""
         return torch.randn(batch_size, seq_len, self.d_noise, device=device)
+
+
+class SeqHead(nn.Module):
+    """Linear head: s_s [*, 1024] → amino acid logits [*, 20].
+
+    Trained on real (s_s, sequence) pairs via cross-entropy. At inference,
+    argmax gives a sequence consistent with the generated embedding, which
+    produces better pLDDT than poly-alanine when passed to ESMFold.
+    """
+
+    N_AA = 20  # standard amino acids (ARNDCQEGHILKMFPSTWYV)
+
+    def __init__(self, s_s_dim: int = 1024):
+        super().__init__()
+        self.proj = nn.Linear(s_s_dim, self.N_AA)
+
+    def forward(self, s_s: torch.Tensor) -> torch.Tensor:
+        """Args:
+            s_s: [..., s_s_dim]
+        Returns:
+            logits: [..., 20]
+        """
+        return self.proj(s_s)
 
 
 class SinusoidalPositionalEncoding(nn.Module):

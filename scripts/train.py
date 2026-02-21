@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
-"""Training script for ESM-Drift (per-residue drifting).
+"""Training script for ESM-Drift (per-residue drifting, no feature encoder).
 
-Trains a drifting generator that maps noise to ESMFold s_s embeddings.
+Trains a DriftingGeneratorUNet that maps noise → ESMFold s_s embeddings.
 
-The drifting field operates on individual residue embeddings (not pooled),
-giving each residue its own gradient signal. All valid residues from generated
-and real proteins are flattened into bags and matched via the cosine kernel.
+The drifting field operates directly on per-residue s_s embeddings, rescaled
+by the real data's mean norm so that pairwise distances are O(1) and the
+L2 kernel exp(-d/tau) gives useful gradients. No separate feature encoder is
+needed: the UNet's internal bottleneck (d_noise→d_model→d_mid→d_bottleneck→...)
+is the learned compression; the rescaling is a fixed, parameter-free operation.
+
+Why no FeatureEncoder:
+  - ESMFold s_s is already feature-rich (36-layer ESM-2)
+  - A separate encoder creates a chicken-and-egg collapse: it learns real data
+    well but maps all (initially poor) gen vectors to the same point, making
+    the drifting field V≈0 and blocking the generator from learning
+  - The scale problem (norms ~4000 → kernel≈0) is solved by fixed rescaling,
+    not by a learned compression layer
 
 Usage:
     uv run python scripts/train.py --data_dir data/ --max_seq_len 64 --device cuda
@@ -25,8 +35,8 @@ from torch.utils.data import DataLoader
 import wandb
 
 from esm_drift.data.dataset import EmbeddingDataset, pad_collate
-from esm_drift.drifting import adaptive_taus, multi_tau_drifting_loss
-from esm_drift.model import DriftingGenerator
+from esm_drift.drifting import adaptive_taus, per_protein_drifting_loss
+from esm_drift.model import DriftingGeneratorUNet, SeqHead
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -34,17 +44,21 @@ log = logging.getLogger(__name__)
 
 def load_real_residues(
     dataset: EmbeddingDataset, max_len: int, device: torch.device
-) -> torch.Tensor:
-    """Load all real data and return flattened raw residue embeddings.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Load all real data.
 
     Returns:
-        real_residues: [n_total_valid, 1024] flattened valid residues (raw)
+        real_residues: [n_total_valid, 1024] flattened valid residues
+        real_s_s:      [N, max_len, 1024] padded protein embeddings
+        real_aa:       [N, max_len] LongTensor amino acid indices (0-19, 20=unk)
+        real_mask:     [N, max_len] boolean mask
     """
     collate = partial(pad_collate, max_len=max_len)
     loader = DataLoader(dataset, batch_size=len(dataset), shuffle=False, collate_fn=collate)
     batch = next(iter(loader))
     real_s_s = batch["s_s"].to(device)
     real_mask = batch["mask"].to(device)
+    real_aa = batch["aa_indices"].to(device)
 
     real_residues = real_s_s[real_mask]  # [n_valid, 1024]
 
@@ -57,12 +71,15 @@ def load_real_residues(
         real_residues.norm(dim=-1).mean().item(),
         real_residues.norm(dim=-1).std().item(),
     )
-    return real_residues.detach()
+    return real_residues.detach(), real_s_s.detach(), real_aa.detach(), real_mask.detach()
 
 
 def train(
     generator: DriftingGenerator,
     real_residues: torch.Tensor,
+    real_s_s: torch.Tensor,
+    real_aa: torch.Tensor,
+    real_mask: torch.Tensor,
     max_len: int,
     device: torch.device,
     epochs: int = 5000,
@@ -71,79 +88,131 @@ def train(
     taus: list[float] | None = None,
     eval_every: int = 200,
     save_dir: str = "checkpoints",
+    max_grad_norm: float = 2.0,
+    eta_min: float = 1e-5,
+    warmup_T0: int = 2000,
+    tau_recal_every: int = 1000,
+    seq_ce_weight: float = 0.05,
 ):
-    """Train the drifting generator with per-residue matching.
+    """Train the drifting generator.
 
-    Uses cosine kernel in raw (unstandardized) 1024D space — the cosine kernel
-    is naturally scale-invariant and works well for direction matching. An
-    auxiliary norm-matching loss ensures generated residues have the right scale.
+    The drifting kernel operates on fixed-scale-normalised residues:
+        scaled = s_s / real_mean_norm
+    This brings norms from ~4000 to ~1, so exp(-d/tau) gives useful weights
+    with tau in the O(0.1-1) range (calibrated by adaptive_taus). No learned
+    feature encoder is used.
+
+    warmup_T0: restart period for CosineAnnealingWarmRestarts (0 = plain cosine).
+    tau_recal_every: re-calibrate taus from current gen distribution every N epochs.
+    seq_ce_weight: weight for sequence CE. Each step samples B real proteins and
+                   uses their sequences as CE targets for the B generated proteins.
     """
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
 
     n_real = real_residues.shape[0]
-    real_mean_norm = real_residues.norm(dim=-1).mean()
-    real_norm_std = real_residues.norm(dim=-1).std()
+    n_proteins = real_s_s.shape[0]
 
-    # Compute adaptive tau from real residue cosine similarities
+    real_mean_norm = real_residues.norm(dim=-1).mean()
+
+    # Taus calibrated from raw real pairwise distances. In 1024D raw space,
+    # typical pairwise distances are O(800-1200), so exp(-d/tau) gives useful
+    # kernel weights (~0.3-0.6) when tau ≈ median_dist. Do NOT rescale
+    # residues before tau calibration — gen-real cross-distances start at the
+    # same order as real-real pairwise distances in raw space, which means the
+    # same taus are appropriate throughout training (kernel never collapses).
     if taus is None:
         taus = adaptive_taus(real_residues, multipliers=(0.5, 1.0, 2.0))
+    taus = list(taus)
     log.info(
         "Training: %d epochs, batch=%d, lr=%s, taus=%s",
-        epochs, batch_size, lr, [f"{t:.4f}" for t in taus],
+        epochs, batch_size, lr, [f"{t:.1f}" for t in taus],
     )
-    log.info("  Real norm: mean=%.1f, std=%.1f", real_mean_norm.item(), real_norm_std.item())
+    log.info("  Warm restarts T0=%d, tau recal every=%d", warmup_T0, tau_recal_every)
+
+    seq_head = SeqHead(s_s_dim=1024).to(device)
 
     generator.train()
-    optimizer = torch.optim.AdamW(generator.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    seq_head.train()
+    optimizer = torch.optim.AdamW(
+        list(generator.parameters()) + list(seq_head.parameters()),
+        lr=lr, weight_decay=1e-4,
+    )
+    if warmup_T0 > 0:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=warmup_T0, T_mult=1, eta_min=eta_min
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epochs, eta_min=eta_min
+        )
 
-    # All generated positions are valid (no padding for generated)
-    mask = torch.ones(batch_size, max_len, dtype=torch.bool, device=device)
-    n_gen_residues = batch_size * max_len
+    gen_mask = torch.ones(batch_size, max_len, dtype=torch.bool, device=device)
 
     best_loss = float("inf")
-    norm_weight = 5000.0  # weight for norm-matching penalty (must compete with drift loss ~10k)
 
     for epoch in range(1, epochs + 1):
         # Generate
         noise = generator.sample_noise(batch_size, max_len, device)
-        gen_s_s = generator(noise, mask)  # [B, L, 1024]
+        gen_s_s = generator(noise, gen_mask)  # [B, L, 1024]
 
-        # Flatten all generated residues (gradient flows through)
-        gen_residues = gen_s_s.reshape(-1, 1024)  # [B*L, 1024]
+        gen_residues = gen_s_s.reshape(-1, 1024)  # [B*L, 1024] — used for norm/eval metrics
 
-        # Anti-symmetry: N_pos = N_neg
-        n_ref = min(n_real, n_gen_residues)
-        neg_idx = torch.randperm(n_gen_residues, device=device)[:n_ref]
-        neg_feat = gen_residues[neg_idx].detach()
-
-        # Add noise to negatives to break collapse equilibrium.
-        # Without this, if all gen residues collapse to the same point,
-        # V⁻ = 0 and there's no repulsive signal to restore diversity.
-        neg_noise_scale = real_norm_std * 2  # ~100, proportional to real spread
-        neg_feat = neg_feat + neg_noise_scale * torch.randn_like(neg_feat)
-
-        if n_real >= n_ref:
-            pos_idx = torch.randperm(n_real, device=device)[:n_ref]
+        # Sample B real proteins — used for BOTH drifting positives and CE targets
+        # so the two losses stay coherent (CE target is the same protein whose
+        # residues the drifting field is pulling the generator toward).
+        if n_proteins >= batch_size:
+            prot_idx = torch.randperm(n_proteins, device=device)[:batch_size]
         else:
-            pos_idx = torch.randint(n_real, (n_ref,), device=device)
-        pos_feat = real_residues[pos_idx]
+            prot_idx = torch.randint(n_proteins, (batch_size,), device=device)
 
-        # Drifting loss (cosine kernel in raw space)
-        drift_loss = multi_tau_drifting_loss(
-            gen_residues, pos_feat, neg_feat, taus=list(taus),
-        )
+        # Drifting positives: each generated protein paired with its matched real protein.
+        # No residues cross protein boundaries in the drifting field.
+        prot_s_s  = real_s_s[prot_idx]   # [B, L, 1024]
+        prot_mask = real_mask[prot_idx]   # [B, L]
 
-        # Norm-matching: MSE on mean norms (large enough to matter)
+        drift_loss = per_protein_drifting_loss(gen_s_s, prot_s_s, prot_mask, taus=list(taus))
+
+        # Norm-matching: keep gen norm close to real norm
+        # (needed in raw 1024D because the drifting field is directional;
+        #  the generator's output_scale must grow to match ~4000)
         gen_norms = gen_residues.norm(dim=-1)
         norm_loss = ((gen_norms.mean() - real_mean_norm) / real_mean_norm) ** 2
 
-        loss = drift_loss + norm_weight * norm_loss
+        # CE targets: same proteins as the drifting positives
+        batch_aa        = real_aa[prot_idx]
+        batch_real_mask = real_mask[prot_idx]
+
+        L = min(gen_s_s.shape[1], batch_aa.shape[1])
+        gen_s_s_ce   = gen_s_s[:, :L, :]
+        batch_aa_L   = batch_aa[:, :L]
+        batch_mask_L = batch_real_mask[:, :L]
+        known_aa = batch_mask_L & (batch_aa_L < 20)
+
+        if known_aa.any():
+            gen_ce_loss = F.cross_entropy(
+                seq_head(gen_s_s_ce)[known_aa],
+                batch_aa_L[known_aa],
+            )
+            real_s_s_batch = real_s_s[prot_idx][:, :L]
+            real_ce_loss = F.cross_entropy(
+                seq_head(real_s_s_batch)[known_aa],
+                batch_aa_L[known_aa],
+            )
+        else:
+            gen_ce_loss = real_ce_loss = torch.tensor(0.0, device=device)
+
+        loss = (drift_loss
+                + 200.0 * norm_loss
+                + seq_ce_weight * gen_ce_loss
+                + 0.5 * seq_ce_weight * real_ce_loss)
 
         optimizer.zero_grad()
         loss.backward()
-        grad_norm = nn.utils.clip_grad_norm_(generator.parameters(), max_norm=10.0)
+        grad_norm = nn.utils.clip_grad_norm_(
+            list(generator.parameters()) + list(seq_head.parameters()),
+            max_norm=max_grad_norm,
+        )
         optimizer.step()
         scheduler.step()
 
@@ -151,6 +220,8 @@ def train(
             "train/loss": loss.item(),
             "train/drift_loss": drift_loss.item(),
             "train/norm_loss": norm_loss.item(),
+            "train/gen_ce_loss": gen_ce_loss.item(),
+            "train/real_ce_loss": real_ce_loss.item(),
             "train/grad_norm": grad_norm.item(),
             "train/lr": scheduler.get_last_lr()[0],
             "train/epoch": epoch,
@@ -158,33 +229,38 @@ def train(
 
         if epoch % eval_every == 0:
             with torch.no_grad():
-                # Per-residue distance metrics
-                cross = torch.cdist(
-                    gen_residues[:200],
-                    real_residues[:200],
-                )
+                cross = torch.cdist(gen_residues[:200], real_residues[:200])
                 mean_dist = cross.mean().item()
-                min_dist = cross.min(dim=1).values.mean().item()
+                min_dist  = cross.min(dim=1).values.mean().item()
 
-                gen_norm_val = gen_norms.mean().item()
+                gen_norm_val  = gen_norms.mean().item()
                 real_norm_val = real_mean_norm.item()
 
-                # Per-residue cosine similarity
-                gen_normed = F.normalize(gen_residues[:200], dim=-1)
+                gen_normed  = F.normalize(gen_residues[:200], dim=-1)
                 real_normed = F.normalize(real_residues[:200], dim=-1)
                 cos_sim = (gen_normed @ real_normed.T).mean().item()
 
-                # Diversity: variance across generated residues
-                gen_std = gen_residues.std(dim=0).mean().item()
+                gen_std  = gen_residues.std(dim=0).mean().item()
                 real_std = real_residues.std(dim=0).mean().item()
 
+                # Sequence recovery
+                eval_aa_flat  = real_aa[real_mask][:500]
+                eval_emb_flat = real_residues[:500]
+                valid = eval_aa_flat < 20
+                if valid.any():
+                    logits  = seq_head(eval_emb_flat[valid])
+                    seq_acc = (logits.argmax(-1) == eval_aa_flat[valid]).float().mean().item()
+                else:
+                    seq_acc = 0.0
+
             log.info(
-                "Epoch %d/%d  loss=%.4f (drift=%.4f norm=%.4f)  grad=%.4f  "
-                "cos_sim=%.4f  mean_dist=%.1f  min_dist=%.1f  "
-                "gen_norm=%.0f  real_norm=%.0f  gen_std=%.2f  real_std=%.2f",
+                "Epoch %d/%d  loss=%.4f (drift=%.4f norm=%.4f gen_ce=%.4f real_ce=%.4f)  "
+                "grad=%.4f  cos_sim=%.4f  mean_dist=%.3f  min_dist=%.3f  "
+                "gen_norm=%.0f  real_norm=%.0f  gen_std=%.2f  real_std=%.2f  seq_acc=%.3f",
                 epoch, epochs, loss.item(), drift_loss.item(), norm_loss.item(),
+                gen_ce_loss.item(), real_ce_loss.item(),
                 grad_norm.item(), cos_sim, mean_dist, min_dist,
-                gen_norm_val, real_norm_val, gen_std, real_std,
+                gen_norm_val, real_norm_val, gen_std, real_std, seq_acc,
             )
             wandb.log({
                 "eval/cos_sim": cos_sim,
@@ -193,33 +269,62 @@ def train(
                 "eval/gen_norm": gen_norm_val,
                 "eval/gen_std": gen_std,
                 "eval/real_std": real_std,
+                "eval/seq_acc": seq_acc,
             })
+
+            if tau_recal_every > 0 and epoch % tau_recal_every == 0:
+                new_taus = adaptive_taus(gen_residues.detach(), multipliers=(0.5, 1.0, 2.0))
+                taus = list(new_taus)
+                log.info(
+                    "  [tau recal @ epoch %d]  new taus: %s",
+                    epoch, [f"{t:.3f}" for t in taus],
+                )
+                wandb.log({"train/tau_base": taus[1], "train/epoch": epoch})
 
             if loss.item() < best_loss:
                 best_loss = loss.item()
                 torch.save({
                     "generator": generator.state_dict(),
+                    "seq_head": seq_head.state_dict(),
                     "epoch": epoch,
                     "loss": best_loss,
                     "config": {
+                        "model_type": "unet",
                         "max_len": max_len,
                         "taus": list(taus),
                         "batch_size": batch_size,
+                        "d_noise": generator.d_noise,
+                        "d_model": generator.d_model,
+                        "d_bottleneck": getattr(generator, "d_bottleneck", None),
+                        "nhead": generator.nhead,
+                        "enc_layers": generator.enc_layers,
+                        "dec_layers": generator.dec_layers,
+                        "num_layers": generator.num_layers,
                     },
                 }, save_path / "best.pt")
 
-    # Save final
     torch.save({
         "generator": generator.state_dict(),
+        "seq_head": seq_head.state_dict(),
         "epoch": epochs,
         "loss": loss.item(),
-        "config": {"max_len": max_len, "taus": list(taus), "batch_size": batch_size},
+        "config": {
+            "model_type": "unet",
+            "max_len": max_len,
+            "taus": list(taus),
+            "batch_size": batch_size,
+            "d_noise": generator.d_noise,
+            "d_model": generator.d_model,
+            "d_bottleneck": getattr(generator, "d_bottleneck", None),
+            "nhead": generator.nhead,
+            "num_layers": generator.num_layers,
+        },
     }, save_path / "final.pt")
     log.info("Training complete. Best loss: %.6f", best_loss)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train ESM-Drift (per-residue)")
+    parser = argparse.ArgumentParser(description="Train ESM-Drift (per-residue, no feature encoder)")
     parser.add_argument("--data_dir", type=str, default="data/")
     parser.add_argument("--max_seq_len", type=int, default=64)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -228,12 +333,23 @@ def main():
     parser.add_argument("--epochs", type=int, default=5000)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--max_grad_norm", type=float, default=2.0)
+    parser.add_argument("--eta_min", type=float, default=1e-5)
+    parser.add_argument("--warmup_T0", type=int, default=2000,
+                        help="LR warm restart period (epochs). 0 = no restarts.")
+    parser.add_argument("--tau_recal_every", type=int, default=1000,
+                        help="Re-calibrate taus from current gen distribution every N epochs (0=off).")
     parser.add_argument("--taus", type=float, nargs="+", default=None)
 
     parser.add_argument("--d_noise", type=int, default=256)
-    parser.add_argument("--d_model", type=int, default=256)
+    parser.add_argument("--d_model", type=int, default=512)
+    parser.add_argument("--d_bottleneck", type=int, default=128,
+                        help="Bottleneck dim for unet model.")
     parser.add_argument("--nhead", type=int, default=8)
-    parser.add_argument("--num_layers", type=int, default=4)
+    parser.add_argument("--num_layers", type=int, default=4,
+                        help="Layers per half of the U-Net (enc=dec=num_layers).")
+
+    parser.add_argument("--seq_ce_weight", type=float, default=0.05)
 
     parser.add_argument("--wandb_project", type=str, default="esm-drift")
     parser.add_argument("--wandb_name", type=str, default=None)
@@ -247,22 +363,21 @@ def main():
     else:
         wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args))
 
-    # Load dataset
     dataset = EmbeddingDataset(args.data_dir, max_seq_len=args.max_seq_len)
     log.info("Dataset: %d samples, max_len=%d", len(dataset), args.max_seq_len)
     if len(dataset) == 0:
         log.error("No samples found!")
         return
 
-    # Load and cache real residue embeddings (raw)
-    real_residues = load_real_residues(dataset, args.max_seq_len, device)
+    real_residues, real_s_s, real_aa, real_mask = load_real_residues(dataset, args.max_seq_len, device)
 
-    # Create generator
-    generator = DriftingGenerator(
+    generator = DriftingGeneratorUNet(
         d_noise=args.d_noise,
         d_model=args.d_model,
+        d_bottleneck=args.d_bottleneck,
         nhead=args.nhead,
-        num_layers=args.num_layers,
+        enc_layers=args.num_layers,
+        dec_layers=args.num_layers,
         s_s_dim=1024,
         max_len=args.max_seq_len,
     ).to(device)
@@ -271,7 +386,7 @@ def main():
     log.info("Generator: %d params (%.1fM)", n_params, n_params / 1e6)
 
     train(
-        generator, real_residues,
+        generator, real_residues, real_s_s, real_aa, real_mask,
         max_len=args.max_seq_len,
         device=device,
         epochs=args.epochs,
@@ -279,6 +394,11 @@ def main():
         lr=args.lr,
         taus=args.taus,
         save_dir=args.save_dir,
+        max_grad_norm=args.max_grad_norm,
+        eta_min=args.eta_min,
+        warmup_T0=args.warmup_T0,
+        tau_recal_every=args.tau_recal_every,
+        seq_ce_weight=args.seq_ce_weight,
     )
     wandb.finish()
 
