@@ -98,6 +98,8 @@ def generate_samples(
     max_len = generator.pos_enc.pe.shape[1]
     n = len(lengths)
     noise = generator.sample_noise(n, max_len, device)
+    z_protein = torch.randn(n, 1, generator.d_noise, device=device)
+    noise = noise + z_protein
     mask = torch.ones(n, max_len, dtype=torch.bool, device=device)
     gen_s_s = generator(noise, mask)  # [n, max_len, 1024]
 

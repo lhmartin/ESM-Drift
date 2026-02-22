@@ -35,7 +35,11 @@ from torch.utils.data import DataLoader
 import wandb
 
 from esm_drift.data.dataset import EmbeddingDataset, pad_collate
-from esm_drift.drifting import adaptive_taus, per_protein_drifting_loss
+from esm_drift.drifting import (
+    adaptive_taus,
+    masked_mean_pool,
+    multi_tau_drifting_loss,
+)
 from esm_drift.model import DriftingGeneratorUNet, SeqHead
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -44,7 +48,7 @@ log = logging.getLogger(__name__)
 
 def load_real_residues(
     dataset: EmbeddingDataset, max_len: int, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Load all real data.
 
     Returns:
@@ -52,6 +56,8 @@ def load_real_residues(
         real_s_s:      [N, max_len, 1024] padded protein embeddings
         real_aa:       [N, max_len] LongTensor amino acid indices (0-19, 20=unk)
         real_mask:     [N, max_len] boolean mask
+        real_means:    [N, 1024] per-protein mean-pooled embeddings
+        real_seq_lens: [N] actual sequence lengths (for dynamic batching)
     """
     collate = partial(pad_collate, max_len=max_len)
     loader = DataLoader(dataset, batch_size=len(dataset), shuffle=False, collate_fn=collate)
@@ -59,27 +65,49 @@ def load_real_residues(
     real_s_s = batch["s_s"].to(device)
     real_mask = batch["mask"].to(device)
     real_aa = batch["aa_indices"].to(device)
+    real_seq_lens = batch["seq_lens"].to(device)  # [N] actual lengths
 
     real_residues = real_s_s[real_mask]  # [n_valid, 1024]
+    real_means = masked_mean_pool(real_s_s, real_mask)  # [N, 1024]
 
     log.info(
         "Real data: %d proteins, %d total residues, padded to L=%d",
         real_s_s.shape[0], real_residues.shape[0], max_len,
     )
     log.info(
+        "  Sequence lengths: min=%d, median=%d, max=%d",
+        real_seq_lens.min().item(),
+        real_seq_lens.median().item(),
+        real_seq_lens.max().item(),
+    )
+    log.info(
         "  Per-residue norm: mean=%.2f, std=%.2f",
         real_residues.norm(dim=-1).mean().item(),
         real_residues.norm(dim=-1).std().item(),
     )
-    return real_residues.detach(), real_s_s.detach(), real_aa.detach(), real_mask.detach()
+    log.info(
+        "  Per-protein mean norm: mean=%.2f, std=%.2f",
+        real_means.norm(dim=-1).mean().item(),
+        real_means.norm(dim=-1).std().item(),
+    )
+    return (
+        real_residues.detach(),
+        real_s_s.detach(),
+        real_aa.detach(),
+        real_mask.detach(),
+        real_means.detach(),
+        real_seq_lens.detach(),
+    )
 
 
 def train(
-    generator: DriftingGenerator,
+    generator: DriftingGeneratorUNet,
     real_residues: torch.Tensor,
     real_s_s: torch.Tensor,
     real_aa: torch.Tensor,
     real_mask: torch.Tensor,
+    real_means: torch.Tensor,
+    real_seq_lens: torch.Tensor,
     max_len: int,
     device: torch.device,
     epochs: int = 5000,
@@ -94,18 +122,27 @@ def train(
     tau_recal_every: int = 1000,
     seq_ce_weight: float = 0.05,
 ):
-    """Train the drifting generator.
+    """Train the drifting generator with global residue-level drifting.
 
-    The drifting kernel operates on fixed-scale-normalised residues:
-        scaled = s_s / real_mean_norm
-    This brings norms from ~4000 to ~1, so exp(-d/tau) gives useful weights
-    with tau in the O(0.1-1) range (calibrated by adaptive_taus). No learned
-    feature encoder is used.
+    Loss terms:
+      1. drift_loss: global drifting on residues. gen_residues [B*L, 1024] are attracted
+         toward B*L randomly-sampled real residues (positives) and repelled from each other
+         (negatives). Taus calibrated on real residue pairwise distances in raw 1024D.
+         Cross-protein repulsion IS present here: gen residues from protein i repel gen
+         residues from protein j, providing natural diversity.
+      2. norm_loss: drives gen_norm toward real_norm (needed for ESMFold decoding).
+      3. gen_ce_loss / real_ce_loss: sequence cross-entropy.
+
+    Architecture notes:
+      - protein_cond in DriftingGeneratorUNet: projects noise.mean(dim=1) to s_s space,
+        providing a protein-specific offset. z_protein broadcast ensures each protein has
+        a unique identity that survives mean-pooling.
+      - noise_skip: per-position diversity.
+      - output_scale: learnable global amplitude matching.
 
     warmup_T0: restart period for CosineAnnealingWarmRestarts (0 = plain cosine).
     tau_recal_every: re-calibrate taus from current gen distribution every N epochs.
-    seq_ce_weight: weight for sequence CE. Each step samples B real proteins and
-                   uses their sequences as CE targets for the B generated proteins.
+    seq_ce_weight: weight for CE losses.
     """
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
@@ -115,15 +152,10 @@ def train(
 
     real_mean_norm = real_residues.norm(dim=-1).mean()
 
-    # Taus calibrated from raw real pairwise distances. In 1024D raw space,
-    # typical pairwise distances are O(800-1200), so exp(-d/tau) gives useful
-    # kernel weights (~0.3-0.6) when tau ≈ median_dist. Do NOT rescale
-    # residues before tau calibration — gen-real cross-distances start at the
-    # same order as real-real pairwise distances in raw space, which means the
-    # same taus are appropriate throughout training (kernel never collapses).
     if taus is None:
         taus = adaptive_taus(real_residues, multipliers=(0.5, 1.0, 2.0))
     taus = list(taus)
+
     log.info(
         "Training: %d epochs, batch=%d, lr=%s, taus=%s",
         epochs, batch_size, lr, [f"{t:.1f}" for t in taus],
@@ -147,57 +179,60 @@ def train(
             optimizer, T_max=epochs, eta_min=eta_min
         )
 
-    gen_mask = torch.ones(batch_size, max_len, dtype=torch.bool, device=device)
-
     best_loss = float("inf")
 
     for epoch in range(1, epochs + 1):
-        # Generate
-        noise = generator.sample_noise(batch_size, max_len, device)
-        gen_s_s = generator(noise, gen_mask)  # [B, L, 1024]
-
-        gen_residues = gen_s_s.reshape(-1, 1024)  # [B*L, 1024] — used for norm/eval metrics
-
-        # Sample B real proteins — used for BOTH drifting positives and CE targets
-        # so the two losses stay coherent (CE target is the same protein whose
-        # residues the drifting field is pulling the generator toward).
+        # Sample B real proteins, then generate at their actual max length.
+        # This eliminates padding waste: a batch of short proteins runs the
+        # Transformer at L_batch << max_len, giving 2-4x speedup on short data.
         if n_proteins >= batch_size:
             prot_idx = torch.randperm(n_proteins, device=device)[:batch_size]
         else:
             prot_idx = torch.randint(n_proteins, (batch_size,), device=device)
 
-        # Drifting positives: each generated protein paired with its matched real protein.
-        # No residues cross protein boundaries in the drifting field.
-        prot_s_s  = real_s_s[prot_idx]   # [B, L, 1024]
-        prot_mask = real_mask[prot_idx]   # [B, L]
+        # L_batch = longest real protein in this batch (no unnecessary padding)
+        L_batch = int(real_seq_lens[prot_idx].max().item())
 
-        drift_loss = per_protein_drifting_loss(gen_s_s, prot_s_s, prot_mask, taus=list(taus))
+        gen_mask = torch.ones(batch_size, L_batch, dtype=torch.bool, device=device)
 
-        # Norm-matching: keep gen norm close to real norm
-        # (needed in raw 1024D because the drifting field is directional;
-        #  the generator's output_scale must grow to match ~4000)
+        noise = generator.sample_noise(batch_size, L_batch, device)
+        # z_protein: per-protein broadcast offset that survives mean-pooling,
+        # giving protein_cond(noise.mean(dim=1)) a protein-specific signal.
+        z_protein = torch.randn(batch_size, 1, generator.d_noise, device=device)
+        noise = noise + z_protein
+        gen_s_s = generator(noise, gen_mask)  # [B, L_batch, 1024]
+
+        gen_residues = gen_s_s.reshape(-1, 1024)  # [B*L_batch, 1024]
+
+        prot_s_s   = real_s_s[prot_idx, :L_batch, :]    # [B, L_batch, 1024]
+        prot_mask  = real_mask[prot_idx, :L_batch]       # [B, L_batch]
+        # Valid real residues from this batch — used as drifting positives
+        pos_residues = prot_s_s[prot_mask]  # [n_valid, 1024]
+
+        # Global drifting: all B*L gen residues are attracted toward the batch's
+        # real residues (positives) and repelled from each other (negatives).
+        # Cross-protein repulsion is implicit: gen_residue from protein i repels
+        # gen_residues from protein j, driving protein-level diversity.
+        drift_loss = multi_tau_drifting_loss(gen_residues, pos_residues, taus)
+
+        # Norm-matching
         gen_norms = gen_residues.norm(dim=-1)
         norm_loss = ((gen_norms.mean() - real_mean_norm) / real_mean_norm) ** 2
 
-        # CE targets: same proteins as the drifting positives
-        batch_aa        = real_aa[prot_idx]
-        batch_real_mask = real_mask[prot_idx]
+        # CE: generated s_s should predict the sequence of the paired real protein
+        batch_aa        = real_aa[prot_idx, :L_batch]
+        batch_real_mask = real_mask[prot_idx, :L_batch]
 
-        L = min(gen_s_s.shape[1], batch_aa.shape[1])
-        gen_s_s_ce   = gen_s_s[:, :L, :]
-        batch_aa_L   = batch_aa[:, :L]
-        batch_mask_L = batch_real_mask[:, :L]
-        known_aa = batch_mask_L & (batch_aa_L < 20)
+        known_aa = batch_real_mask & (batch_aa < 20)
 
         if known_aa.any():
             gen_ce_loss = F.cross_entropy(
-                seq_head(gen_s_s_ce)[known_aa],
-                batch_aa_L[known_aa],
+                seq_head(gen_s_s)[known_aa],
+                batch_aa[known_aa],
             )
-            real_s_s_batch = real_s_s[prot_idx][:, :L]
             real_ce_loss = F.cross_entropy(
-                seq_head(real_s_s_batch)[known_aa],
-                batch_aa_L[known_aa],
+                seq_head(prot_s_s)[known_aa],
+                batch_aa[known_aa],
             )
         else:
             gen_ce_loss = real_ce_loss = torch.tensor(0.0, device=device)
@@ -243,6 +278,21 @@ def train(
                 gen_std  = gen_residues.std(dim=0).mean().item()
                 real_std = real_residues.std(dim=0).mean().item()
 
+                # Protein-level diversity: pairwise L2 of per-protein mean-pooled embeddings
+                gen_means = masked_mean_pool(gen_s_s, gen_mask)  # [B, 1024]
+                gen_pairwise = torch.cdist(gen_means, gen_means)
+                off_diag_mask = ~torch.eye(batch_size, dtype=torch.bool, device=device)
+                gen_pairwise_l2 = gen_pairwise[off_diag_mask].mean().item()
+                # Compare against real protein mean pairwise L2
+                real_means_batch = real_means[prot_idx]
+                real_pairwise = torch.cdist(real_means_batch, real_means_batch)
+                real_pairwise_l2 = real_pairwise[off_diag_mask].mean().item()
+
+                # Nearest real protein index for each gen protein
+                all_dists = torch.cdist(gen_means, real_means)  # [B, N_real]
+                nearest_idx = all_dists.argmin(dim=1).tolist()
+                n_unique = len(set(nearest_idx))
+
                 # Sequence recovery
                 eval_aa_flat  = real_aa[real_mask][:500]
                 eval_emb_flat = real_residues[:500]
@@ -256,11 +306,13 @@ def train(
             log.info(
                 "Epoch %d/%d  loss=%.4f (drift=%.4f norm=%.4f gen_ce=%.4f real_ce=%.4f)  "
                 "grad=%.4f  cos_sim=%.4f  mean_dist=%.3f  min_dist=%.3f  "
-                "gen_norm=%.0f  real_norm=%.0f  gen_std=%.2f  real_std=%.2f  seq_acc=%.3f",
-                epoch, epochs, loss.item(), drift_loss.item(), norm_loss.item(),
-                gen_ce_loss.item(), real_ce_loss.item(),
+                "gen_norm=%.0f  real_norm=%.0f  gen_std=%.2f  real_std=%.2f  seq_acc=%.3f  "
+                "prot_L2=%.1f (real=%.1f)  unique=%d/%d",
+                epoch, epochs, loss.item(), drift_loss.item(),
+                norm_loss.item(), gen_ce_loss.item(), real_ce_loss.item(),
                 grad_norm.item(), cos_sim, mean_dist, min_dist,
                 gen_norm_val, real_norm_val, gen_std, real_std, seq_acc,
+                gen_pairwise_l2, real_pairwise_l2, n_unique, batch_size,
             )
             wandb.log({
                 "eval/cos_sim": cos_sim,
@@ -270,6 +322,10 @@ def train(
                 "eval/gen_std": gen_std,
                 "eval/real_std": real_std,
                 "eval/seq_acc": seq_acc,
+                "eval/gen_pairwise_l2": gen_pairwise_l2,
+                "eval/real_pairwise_l2": real_pairwise_l2,
+                "eval/unique_nearest": n_unique,
+                "eval/L_batch": L_batch,
             })
 
             if tau_recal_every > 0 and epoch % tau_recal_every == 0:
@@ -369,7 +425,7 @@ def main():
         log.error("No samples found!")
         return
 
-    real_residues, real_s_s, real_aa, real_mask = load_real_residues(dataset, args.max_seq_len, device)
+    real_residues, real_s_s, real_aa, real_mask, real_means, real_seq_lens = load_real_residues(dataset, args.max_seq_len, device)
 
     generator = DriftingGeneratorUNet(
         d_noise=args.d_noise,
@@ -386,7 +442,7 @@ def main():
     log.info("Generator: %d params (%.1fM)", n_params, n_params / 1e6)
 
     train(
-        generator, real_residues, real_s_s, real_aa, real_mask,
+        generator, real_residues, real_s_s, real_aa, real_mask, real_means, real_seq_lens,
         max_len=args.max_seq_len,
         device=device,
         epochs=args.epochs,

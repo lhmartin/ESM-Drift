@@ -107,8 +107,15 @@ class DriftingGeneratorUNet(nn.Module):
         self.output_norm = nn.LayerNorm(d_model)
         self.s_s_head    = nn.Linear(d_model, s_s_dim)
 
-        self.noise_skip  = nn.Linear(d_noise, s_s_dim, bias=False)
+        self.noise_skip   = nn.Linear(d_noise, s_s_dim, bias=False)
         self.output_scale = nn.Parameter(torch.tensor(10.0))
+        # Protein-level conditioning: projects noise.mean(dim=1) ≈ z_protein (the
+        # broadcast per-protein noise offset) to a per-protein offset in s_s space.
+        # Added AFTER output_scale so protein_cond has its own independent magnitude,
+        # controlled only by its init std (not affected by output_scale training).
+        # Target: protein_cond creates prot_L2 ≈ 290, matching real prot_L2 median.
+        self.protein_cond = nn.Linear(d_noise, s_s_dim, bias=False)
+        nn.init.normal_(self.protein_cond.weight, std=0.4)
 
     def forward(self, noise: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
@@ -138,6 +145,10 @@ class DriftingGeneratorUNet(nn.Module):
         s_s = self.s_s_head(d1)
         s_s = s_s + self.noise_skip(noise)
         s_s = s_s * self.output_scale
+        # Protein-level offset: added after output_scale so it has its own independent
+        # scale. noise.mean(dim=1) ≈ z_protein (broadcast offset, not averaged away).
+        protein_offset = self.protein_cond(noise.mean(dim=1)).unsqueeze(1)  # [B, 1, s_s_dim]
+        s_s = s_s + protein_offset
         s_s = s_s * mask.unsqueeze(-1).float()
         return s_s
 

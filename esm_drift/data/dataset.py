@@ -8,6 +8,18 @@ from torch.utils.data import Dataset
 
 log = logging.getLogger(__name__)
 
+# AlphaFold2/OpenFold amino acid ordering (matches ESMFold internals)
+_RESTYPES = "ARNDCQEGHILKMFPSTWYV"
+_RESTYPE_ORDER = {aa: i for i, aa in enumerate(_RESTYPES)}
+_UNK_IDX = 20  # unknown / non-standard residue → ignored in CE loss
+
+
+def sequence_to_aa_indices(sequence: str) -> torch.Tensor:
+    """Convert amino acid string to LongTensor of indices [0, 19] (unknown=20)."""
+    return torch.tensor(
+        [_RESTYPE_ORDER.get(aa, _UNK_IDX) for aa in sequence], dtype=torch.long
+    )
+
 
 class EmbeddingDataset(Dataset):
     """Dataset that loads pre-extracted ESMFold embeddings from .pt files.
@@ -77,12 +89,14 @@ class EmbeddingDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         data = torch.load(self.files[idx], map_location="cpu", weights_only=False)
+        seq = data["sequence"]
         return {
-            "s_s": data["s_s"],             # [L, 1024]
-            "s_z": data["s_z"],             # [L, L, 128]
-            "sequence": data["sequence"],
+            "s_s": data["s_s"],                         # [L, 1024]
+            "s_z": data["s_z"],                         # [L, L, 128]
+            "sequence": seq,
+            "aa_indices": sequence_to_aa_indices(seq),  # [L] LongTensor
             "seq_len": data["seq_len"],
-            "plddt": data["plddt"],         # [L]
+            "plddt": data["plddt"],                     # [L]
             "ptm": data["ptm"],
         }
 
@@ -114,16 +128,21 @@ def pad_collate(batch: list[dict], max_len: int | None = None) -> dict:
     s_s_padded = torch.zeros(B, L_max, s_s_dim)
     s_z_padded = torch.zeros(B, L_max, L_max, s_z_dim)
     mask = torch.zeros(B, L_max, dtype=torch.bool)
+    # aa_indices: pad with _UNK_IDX (20) so unknown residues are ignored in CE
+    aa_padded = torch.full((B, L_max), _UNK_IDX, dtype=torch.long)
 
     for i, item in enumerate(batch):
         L = min(item["seq_len"], L_max)
         s_s_padded[i, :L] = item["s_s"][:L]
         s_z_padded[i, :L, :L] = item["s_z"][:L, :L]
         mask[i, :L] = True
+        if "aa_indices" in item:
+            aa_padded[i, :L] = item["aa_indices"][:L]
 
     return {
         "s_s": s_s_padded,
         "s_z": s_z_padded,
         "mask": mask,
+        "aa_indices": aa_padded,        # [B, L_max] amino acid indices (20 = pad/unk)
         "seq_lens": torch.tensor(seq_lens),
     }

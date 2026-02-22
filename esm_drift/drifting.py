@@ -149,6 +149,89 @@ def per_protein_drifting_loss(
     return torch.stack(losses).mean()
 
 
+def masked_mean_pool(
+    s_s: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Mean-pool [B, L, D] → [B, D] over valid (non-padding) residues.
+
+    Args:
+        s_s:  [B, L, D]
+        mask: [B, L] bool, True = valid residue
+    Returns:
+        means: [B, D]
+    """
+    mask_f = mask.float().unsqueeze(-1)                   # [B, L, 1]
+    sums   = (s_s * mask_f).sum(dim=1)                   # [B, D]
+    counts = mask_f.sum(dim=1).clamp_min(1.0)            # [B, 1]
+    return sums / counts                                  # [B, D]
+
+
+def protein_level_drifting_loss(
+    gen_s_s: torch.Tensor,
+    pos_s_s: torch.Tensor,
+    pos_mask: torch.Tensor,
+    gen_mask: torch.Tensor,
+    taus: list[float],
+) -> torch.Tensor:
+    """Protein-level drifting loss on L2-normalised mean-pooled embeddings.
+
+    Mean-pools each protein to [D], then L2-normalises to unit vectors so the
+    loss is scale-invariant (works at any gen_norm). Runs standard drifting on
+    the B unit-sphere protein vectors.
+
+    At equilibrium: gen mean distribution matches real mean distribution on the
+    unit sphere. Cross-protein repulsion (gen-as-negatives) prevents mode collapse.
+
+    Taus should use LARGE multipliers (e.g. 5x, 10x, 20x) relative to the median
+    real-real distance on the unit sphere (~0.14), so that the kernel gives useful
+    weights when gen means start far from the real cluster (at init with protein_cond,
+    gen means are uniformly spread, distance ~1.0-1.4 from the real cluster).
+
+    Args:
+        gen_s_s:  [B, L, D]   generated embeddings
+        pos_s_s:  [B, L, D]   padded real embeddings (matched 1-to-1)
+        pos_mask: [B, L]      True where real residues are valid
+        gen_mask: [B, L]      True where generated residues are valid
+        taus:     list of kernel temperatures (calibrated on unit-sphere protein means)
+
+    Returns:
+        scalar loss
+    """
+    gen_means = F.normalize(masked_mean_pool(gen_s_s, gen_mask), dim=-1)  # [B, D] unit vectors
+    pos_means = F.normalize(masked_mean_pool(pos_s_s, pos_mask), dim=-1)  # [B, D] unit vectors
+    return multi_tau_drifting_loss(gen_means, pos_means, taus)
+
+
+def protein_diversity_loss(
+    gen_s_s: torch.Tensor,
+    gen_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Cross-protein diversity loss: penalise pairwise cosine similarity.
+
+    Mean-pools each generated protein to [D] and L2-normalises to a unit
+    vector. The loss is the mean pairwise cosine similarity over all (i, j)
+    pairs with i ≠ j. Range: 1 = complete collapse (all identical), 0 =
+    orthogonal (fully diverse). Minimising this loss provides cross-protein
+    repulsion that per_protein_drifting_loss cannot supply (it only sees one
+    protein at a time).
+
+    Scale-invariant: works at any gen_norm (early or late training).
+
+    Args:
+        gen_s_s:  [B, L, D]   generated protein embeddings
+        gen_mask: [B, L]      True where positions are valid
+
+    Returns:
+        scalar loss in [0, 1]
+    """
+    gen_means = F.normalize(masked_mean_pool(gen_s_s, gen_mask), dim=-1)  # [B, D]
+    B = gen_means.shape[0]
+    sim = gen_means @ gen_means.T                                           # [B, B]
+    off_diag = sim[~torch.eye(B, dtype=torch.bool, device=sim.device)]    # [B*(B-1)]
+    return off_diag.mean()
+
+
 def adaptive_taus(
     features: torch.Tensor,
     multipliers: tuple[float, ...] = (0.5, 1.0, 2.0),

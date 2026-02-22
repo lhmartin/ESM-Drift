@@ -1,0 +1,32 @@
+[project]
+name = "esm-drift"
+version = "0.1.0"
+description = "One-step protein structure generation via drifting on ESMFold embeddings"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.40",
+    "biopython>=1.84",
+    "wandb>=0.18",
+    "tqdm>=4.66",
+    "ipykernel>=7.2.0",
+    "ipywidgets>=8.1.8",
+    "tmtools>=0.3.0",
+    "pandas>=2.3.3",
+    "pyarrow>=23.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.8",
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
