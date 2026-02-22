@@ -31,6 +31,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from functools import partial
 
+from esm_drift.config import Config
 from esm_drift.data.dataset import EmbeddingDataset, pad_collate
 from esm_drift.data.dataset import _RESTYPES as RESTYPES
 from esm_drift.model import DriftingGeneratorUNet, SeqHead
@@ -45,24 +46,23 @@ log = logging.getLogger(__name__)
 
 def load_checkpoint(
     path: str, device: torch.device
-) -> tuple[DriftingGeneratorUNet, SeqHead | None, dict]:
+) -> tuple[DriftingGeneratorUNet, SeqHead | None, Config]:
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    config = ckpt["config"]
-    _nl = config.get("num_layers", 6)
-    _default_half = max(1, _nl // 2)
+    cfg = Config.from_dict(ckpt["config"])
     generator = DriftingGeneratorUNet(
-        d_noise=config.get("d_noise", 256),
-        d_model=config.get("d_model", 512),
-        d_bottleneck=config.get("d_bottleneck", 128),
-        nhead=config.get("nhead", 8),
-        enc_layers=config.get("enc_layers", _default_half),
-        dec_layers=config.get("dec_layers", _default_half),
+        d_noise=cfg.d_noise,
+        d_model=cfg.d_model,
+        d_bottleneck=cfg.d_bottleneck,
+        nhead=cfg.nhead,
+        enc_layers=cfg.num_layers,
+        dec_layers=cfg.num_layers,
         s_s_dim=1024,
-        max_len=config["max_len"],
+        max_len=cfg.max_len,
+        use_length_cond=cfg.use_length_cond,
     ).to(device)
     generator.load_state_dict(ckpt["generator"])
     generator.eval()
-    log.info("Loaded DriftingGeneratorUNet from checkpoint (epoch=%s)", config.get("epoch"))
+    log.info("Loaded DriftingGeneratorUNet from checkpoint (epoch=%s)", ckpt.get("epoch"))
 
     seq_head = None
     if "seq_head" in ckpt:
@@ -73,7 +73,7 @@ def load_checkpoint(
     else:
         log.info("No seq_head in checkpoint — will use poly-alanine for decoding.")
 
-    return generator, seq_head, config
+    return generator, seq_head, cfg
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +101,8 @@ def generate_samples(
     z_protein = torch.randn(n, 1, generator.d_noise, device=device)
     noise = noise + z_protein
     mask = torch.ones(n, max_len, dtype=torch.bool, device=device)
-    gen_s_s = generator(noise, mask)  # [n, max_len, 1024]
+    lengths_t = torch.tensor(lengths, dtype=torch.long, device=device)
+    gen_s_s = generator(noise, mask, lengths=lengths_t)  # [n, max_len, 1024]
 
     gen_samples, gen_seqs = [], []
     for i in range(n):
@@ -376,12 +377,11 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    generator, seq_head, config = load_checkpoint(args.checkpoint, device)
-    max_len = config["max_len"]
-    log.info("Loaded checkpoint: epoch=%s  max_len=%d", config.get("epoch"), max_len)
+    generator, seq_head, cfg = load_checkpoint(args.checkpoint, device)
+    log.info("Loaded checkpoint: max_len=%d  use_length_cond=%s", cfg.max_len, cfg.use_length_cond)
 
     # Load dataset
-    dataset = EmbeddingDataset(args.data_dir, max_seq_len=max_len)
+    dataset = EmbeddingDataset(args.data_dir, max_seq_len=cfg.max_len)
     if len(dataset) == 0:
         log.error("No data found in %s", args.data_dir)
         return
@@ -402,7 +402,7 @@ def main():
         log.info("Predicted sequences: %s", gen_seqs)
 
     # Load real data into memory for metrics
-    collate = partial(pad_collate, max_len=max_len)
+    collate = partial(pad_collate, max_len=cfg.max_len)
     loader = DataLoader(dataset, batch_size=len(dataset), shuffle=False, collate_fn=collate)
     batch = next(iter(loader))
     real_s_s = batch["s_s"].to(device)

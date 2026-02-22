@@ -48,6 +48,7 @@ class DriftingGeneratorUNet(nn.Module):
         s_s_dim: int = 1024,
         dropout: float = 0.0,
         max_len: int = 512,
+        use_length_cond: bool = True,
     ):
         super().__init__()
         self.d_noise = d_noise
@@ -83,8 +84,14 @@ class DriftingGeneratorUNet(nn.Module):
             )
             return nn.TransformerEncoder(layer, num_layers=n)
 
+        self.max_len = max_len
+        self.use_length_cond = use_length_cond
         self.input_proj = nn.Linear(d_noise, d_model)
         self.pos_enc = SinusoidalPositionalEncoding(d_model, max_len)
+        if use_length_cond:
+            # Length conditioning: broadcast a learned per-length offset to all positions.
+            # Lets the model learn different s_s patterns for short vs long proteins.
+            self.length_emb = nn.Embedding(max_len + 1, d_model)
 
         # Encoder: d_model → d_mid → d_bottleneck
         self.enc1 = _transformer(d_model, enc1_layers)
@@ -117,17 +124,24 @@ class DriftingGeneratorUNet(nn.Module):
         self.protein_cond = nn.Linear(d_noise, s_s_dim, bias=False)
         nn.init.normal_(self.protein_cond.weight, std=0.4)
 
-    def forward(self, noise: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, noise: torch.Tensor, mask: torch.Tensor, lengths: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """
         Args:
-            noise: [B, L, d_noise]
-            mask:  [B, L] boolean, True = valid residue
+            noise:   [B, L, d_noise]
+            mask:    [B, L] boolean, True = valid residue
+            lengths: [B] LongTensor of actual protein lengths (1..max_len).
+                     If None, no length conditioning is applied.
         Returns:
             s_s: [B, L, s_s_dim]
         """
         pad_mask = ~mask  # Transformer convention: True = ignore
 
         h = self.input_proj(noise) + self.pos_enc(noise)  # [B, L, d_model]
+        if lengths is not None and self.use_length_cond:
+            # Broadcast a per-protein length embedding to all sequence positions
+            h = h + self.length_emb(lengths.clamp(1, self.max_len)).unsqueeze(1)  # [B, 1, d_model]
 
         # Encoder — compress feature dimension stage by stage
         e1 = self.enc1(h,          src_key_padding_mask=pad_mask)  # [B, L, d_model]  ← skip1
