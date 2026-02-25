@@ -122,7 +122,7 @@ def train(
     log.info("  use_length_cond=%s  use_strict_antisymmetry=%s  use_dynamic_len=%s",
              generator.use_length_cond, cfg.use_strict_antisymmetry, cfg.use_dynamic_len)
 
-    seq_head = SeqHead(s_s_dim=1024).to(device)
+    seq_head = SeqHead(s_s_dim=cfg.s_s_dim).to(device)
     generator.train()
     seq_head.train()
 
@@ -170,7 +170,7 @@ def train(
         noise     = noise + z_protein
         gen_s_s   = generator(noise, gen_mask, lengths=prot_lens)  # [B, L_batch, 1024]
 
-        gen_residues = gen_s_s.reshape(-1, 1024)  # [B*L_batch, 1024]
+        gen_residues = gen_s_s.reshape(-1, cfg.s_s_dim)  # [B*L_batch, s_s_dim]
         prot_s_s     = real_s_s[prot_idx, :L_batch, :]   # [B, L_batch, 1024]
         prot_mask    = real_mask[prot_idx, :L_batch]      # [B, L_batch]
         pos_residues = prot_s_s[prot_mask]                # [n_valid, 1024]
@@ -203,14 +203,16 @@ def train(
         batch_mask   = real_mask[prot_idx, :L_batch]
         known_aa     = batch_mask & (batch_aa < 20)
         if known_aa.any():
-            gen_ce_loss  = F.cross_entropy(seq_head(gen_s_s)[known_aa], batch_aa[known_aa])
+            # Detach gen_s_s: seq_head trains on generated embeddings but noise gradient
+            # from gen_ce does NOT flow back into the generator (gen_ce ≈ 3.0 = random).
+            gen_ce_loss  = F.cross_entropy(seq_head(gen_s_s.detach())[known_aa], batch_aa[known_aa])
             real_ce_loss = F.cross_entropy(seq_head(prot_s_s)[known_aa], batch_aa[known_aa])
         else:
             gen_ce_loss = real_ce_loss = torch.tensor(0.0, device=device)
 
         loss = (drift_loss
                 + cfg.prot_drift_weight * prot_drift_loss
-                + 200.0 * norm_loss
+                + cfg.norm_loss_weight * norm_loss
                 + cfg.seq_ce_weight * gen_ce_loss
                 + 0.5 * cfg.seq_ce_weight * real_ce_loss)
 
@@ -402,9 +404,11 @@ def main():
         nhead=cfg.nhead,
         enc_layers=cfg.num_layers,
         dec_layers=cfg.num_layers,
-        s_s_dim=1024,
+        s_s_dim=cfg.s_s_dim,
         max_len=cfg.max_len,
         use_length_cond=cfg.use_length_cond,
+        output_scale_init=cfg.output_scale_init,
+        protein_cond_std=cfg.protein_cond_std,
     ).to(device)
 
     n_params = sum(p.numel() for p in generator.parameters())

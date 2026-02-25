@@ -45,10 +45,12 @@ class DriftingGeneratorUNet(nn.Module):
         nhead: int = 8,
         enc_layers: int = 3,
         dec_layers: int = 3,
-        s_s_dim: int = 1024,
+        s_s_dim: int = 32,
         dropout: float = 0.0,
         max_len: int = 512,
         use_length_cond: bool = True,
+        output_scale_init: float = 10.0,
+        protein_cond_std: float = 0.4,
     ):
         super().__init__()
         self.d_noise = d_noise
@@ -115,14 +117,13 @@ class DriftingGeneratorUNet(nn.Module):
         self.s_s_head    = nn.Linear(d_model, s_s_dim)
 
         self.noise_skip   = nn.Linear(d_noise, s_s_dim, bias=False)
-        self.output_scale = nn.Parameter(torch.tensor(10.0))
+        self.output_scale = nn.Parameter(torch.tensor(float(output_scale_init)))
         # Protein-level conditioning: projects noise.mean(dim=1) ≈ z_protein (the
         # broadcast per-protein noise offset) to a per-protein offset in s_s space.
         # Added AFTER output_scale so protein_cond has its own independent magnitude,
         # controlled only by its init std (not affected by output_scale training).
-        # Target: protein_cond creates prot_L2 ≈ 290, matching real prot_L2 median.
         self.protein_cond = nn.Linear(d_noise, s_s_dim, bias=False)
-        nn.init.normal_(self.protein_cond.weight, std=0.4)
+        nn.init.normal_(self.protein_cond.weight, std=protein_cond_std)
 
     def forward(
         self, noise: torch.Tensor, mask: torch.Tensor, lengths: torch.Tensor | None = None
@@ -180,7 +181,7 @@ class SeqHead(nn.Module):
 
     N_AA = 20  # standard amino acids (ARNDCQEGHILKMFPSTWYV)
 
-    def __init__(self, s_s_dim: int = 1024):
+    def __init__(self, s_s_dim: int = 32):
         super().__init__()
         self.proj = nn.Linear(s_s_dim, self.N_AA)
 

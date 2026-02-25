@@ -70,6 +70,10 @@ class EmbeddingDataset(Dataset):
                 log.warning("Could not load %s: %s", f, e)
                 continue
 
+            # Skip files that contain no embedding (e.g. scaler_stats.pt)
+            if "s_s" not in data and "z" not in data:
+                continue
+
             seq_len = data.get("seq_len", len(data.get("sequence", "")))
             ptm = data.get("ptm", 1.0)
             plddt = data.get("plddt", None)
@@ -89,15 +93,19 @@ class EmbeddingDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         data = torch.load(self.files[idx], map_location="cpu", weights_only=False)
-        seq = data["sequence"]
+        seq = data.get("sequence", "")
+        # Support both raw s_s [L, 1024] and CHEAP z [L, 32] embeddings
+        emb = data.get("s_s", data.get("z"))
+        L = emb.shape[0]
+        s_z = data.get("s_z", torch.zeros(L, L, 1))  # placeholder if absent
         return {
-            "s_s": data["s_s"],                         # [L, 1024]
-            "s_z": data["s_z"],                         # [L, L, 128]
+            "s_s": emb,                                 # [L, emb_dim]
+            "s_z": s_z,                                 # [L, L, s_z_dim]
             "sequence": seq,
             "aa_indices": sequence_to_aa_indices(seq),  # [L] LongTensor
-            "seq_len": data["seq_len"],
-            "plddt": data["plddt"],                     # [L]
-            "ptm": data["ptm"],
+            "seq_len": data.get("seq_len", L),
+            "plddt": data.get("plddt", torch.ones(L)),  # [L]
+            "ptm": data.get("ptm", 1.0),
         }
 
 

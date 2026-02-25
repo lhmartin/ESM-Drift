@@ -7,6 +7,65 @@ import torch
 
 log = logging.getLogger(__name__)
 
+
+class CheapDecoder:
+    """Decode CHEAP z [L, 32] → s_s [L, 1024] using the hourglass autoencoder.
+
+    Uses the same per-channel normalisation statistics that encode_cheap.py
+    saved to data/cheap/scaler_stats.pt, ensuring the hourglass receives
+    inputs in the [-1, 1] range it was trained on.
+
+    Usage:
+        cheap = CheapDecoder(stats_path="data/cheap/scaler_stats.pt", device="cuda")
+        s_s = cheap.z_to_s_s(z)  # z [B, L, 32] → s_s [B, L, 1024]
+    """
+
+    def __init__(
+        self,
+        stats_path: str | Path = "data/cheap/scaler_stats.pt",
+        model_name: str = "shorten_1_dim_32",
+        device: str = "cuda",
+    ):
+        self.device = torch.device(device)
+        self._model = None
+        self.model_name = model_name
+
+        stats = torch.load(stats_path, map_location="cpu", weights_only=False)
+        self.chan_min = stats["chan_min"].to(self.device)  # [1024]
+        self.chan_max = stats["chan_max"].to(self.device)  # [1024]
+
+    def _load_model(self):
+        if self._model is not None:
+            return
+        from cheap.pretrained import load_model_from_id
+        from cheap.constants import CATH_COMPRESS_LEVEL_TO_ID
+        model_id = CATH_COMPRESS_LEVEL_TO_ID[1][32]
+        log.info("Loading CHEAP hourglass model (id=%s)...", model_id)
+        self._model = load_model_from_id(model_id, infer_mode=True).to(self.device)
+        log.info("CHEAP loaded.")
+
+    @torch.no_grad()
+    def z_to_s_s(self, z: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Decode CHEAP latent to ESMFold s_s.
+
+        Args:
+            z:    [B, L, 32] CHEAP latent codes
+            mask: [B, L] boolean, True = valid (default: all valid)
+        Returns:
+            s_s: [B, L, 1024]
+        """
+        self._load_model()
+        z = z.to(self.device)
+        if mask is None:
+            mask = torch.ones(z.shape[:2], dtype=torch.bool, device=self.device)
+        else:
+            mask = mask.to(self.device)
+
+        s_s_norm = self._model.dec(z, mask)                          # [B, L, 1024]
+        denom = (self.chan_max - self.chan_min).clamp_min(1e-6)
+        s_s = (s_s_norm + 1.0) / 2.0 * denom + self.chan_min        # unscale
+        return s_s
+
 # AlphaFold2/OpenFold amino acid ordering (used by ESMFold internally)
 RESTYPES = "ARNDCQEGHILKMFPSTWYV"
 RESTYPE_ORDER = {aa: i for i, aa in enumerate(RESTYPES)}

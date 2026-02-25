@@ -1,0 +1,43 @@
+# v13-long: maximum batch size long run
+# Dataset: 3814 proteins @ max_len=128 (3x more than v12)
+# Batch: 128 (max safe on RTX 5000 Ada 16GB — tested at 12.92GB peak)
+# Epochs: 20000 (v12 converged at ~7000; extra budget for larger dataset)
+# LR schedule: T0=3000, T_mult=2 → restarts at 3000, 6000, 12000 epochs
+data_dir: data/
+
+# Model (same as v12 — proven architecture)
+d_noise: 256
+d_model: 512
+d_bottleneck: 128
+nhead: 8
+num_layers: 4
+max_len: 128
+use_length_cond: true
+
+# Training
+epochs: 50000
+batch_size: 128
+lr: 3.0e-4
+max_grad_norm: 2.0
+eta_min: 1.0e-5
+eval_every: 500
+
+# LR schedule (longer T0 to match more epochs)
+warmup_T0: 3000
+warmup_T_mult: 2
+
+# Kernel
+taus: null
+tau_recal_every: 2000
+
+# Loss weights (same as v12)
+seq_ce_weight: 0.05
+prot_drift_weight: 0.5
+use_strict_antisymmetry: true
+use_dynamic_len: true
+
+# Infrastructure
+device: cuda
+save_dir: checkpoints/v13-long
+wandb_project: esm-drift
+wandb_name: v13-long

@@ -1,0 +1,59 @@
+# v14-cheap: CHEAP/PLAID latent space (shorten_1_dim_32)
+# Generator operates in z [L, 32] — 32x smaller latent vs raw s_s [L, 1024]
+# Data: data/cheap/ (run scripts/encode_cheap.py first)
+# Expected improvements over v13:
+#   - Within-protein residue cosine sim: 0.996 → 0.807 (actual structure signal)
+#   - Per-channel variance: tanh-bounded, well-conditioned for drifting
+#   - Convergence: should be faster (no degenerate manifold)
+data_dir: data/cheap/
+
+# CHEAP settings
+s_s_dim: 32
+cheap_model: shorten_1_dim_32
+# Calibrated for CHEAP z-space (norms ≈ 1.48 vs 4685 for raw s_s):
+#   output_scale_init: 10 * 1.48/57 ≈ 0.26 (57 = measured gen_norm with scale=10)
+#   protein_cond_std:  0.4 * 0.4/65 ≈ 0.0025 (real prot_L2=0.4 vs 65 with std=0.4)
+output_scale_init: 0.26
+protein_cond_std: 0.0025
+
+# Model (same proven architecture as v12/v13)
+d_noise: 256
+d_model: 512
+d_bottleneck: 128
+nhead: 8
+num_layers: 4
+max_len: 128
+use_length_cond: true
+
+# Training
+epochs: 20000
+batch_size: 128
+lr: 3.0e-4
+max_grad_norm: 2.0
+eta_min: 1.0e-5
+eval_every: 500
+
+# LR schedule
+warmup_T0: 3000
+warmup_T_mult: 2
+
+# Kernel (auto-calibrate taus from CHEAP z distribution)
+taus: null
+tau_recal_every: 2000
+
+# Loss weights (recalibrated for CHEAP z-space)
+# - gen_ce is detached from generator (see train.py) — no noise gradient into generator
+# - norm_loss_weight: 200→20 (CHEAP z norms ≈1.48, raw value is 1000x smaller than s_s)
+#   At epoch 10: 20×0.0003=0.006 ≈ 30% of drift(0.02), balanced
+# - prot_drift_weight: keep 0.5, taus [0.7,1.4,2.8] work on unit sphere (scale-invariant)
+seq_ce_weight: 0.05
+prot_drift_weight: 0.5
+norm_loss_weight: 20
+use_strict_antisymmetry: true
+use_dynamic_len: true
+
+# Infrastructure
+device: cuda
+save_dir: checkpoints/v14-cheap
+wandb_project: esm-drift
+wandb_name: v14-cheap

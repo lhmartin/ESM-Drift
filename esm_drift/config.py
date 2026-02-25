@@ -60,10 +60,17 @@ class Config:
     # ── Loss weights ──────────────────────────────────────────────────────────
     seq_ce_weight: float = 0.05
     prot_drift_weight: float = 0.5   # 0.0 = disabled
+    norm_loss_weight: float = 200.0  # weight on norm-matching loss
 
     # ── Ablation flags ────────────────────────────────────────────────────────
     use_strict_antisymmetry: bool = True
     use_dynamic_len: bool = True
+
+    # ── CHEAP latent space ────────────────────────────────────────────────────
+    s_s_dim: int = 1024           # generator output dim: 1024 for raw s_s, 32 for CHEAP
+    cheap_model: str = "shorten_1_dim_32"  # CHEAP variant (only used when s_s_dim != 1024)
+    output_scale_init: float = 10.0   # initial value of learnable output_scale parameter
+    protein_cond_std: float = 0.4     # init std for protein_cond Linear weights
 
     # ── Infrastructure ────────────────────────────────────────────────────────
     device: str = "cuda"

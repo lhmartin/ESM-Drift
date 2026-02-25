@@ -56,9 +56,11 @@ def load_checkpoint(
         nhead=cfg.nhead,
         enc_layers=cfg.num_layers,
         dec_layers=cfg.num_layers,
-        s_s_dim=1024,
+        s_s_dim=cfg.s_s_dim,
         max_len=cfg.max_len,
         use_length_cond=cfg.use_length_cond,
+        output_scale_init=cfg.output_scale_init,
+        protein_cond_std=cfg.protein_cond_std,
     ).to(device)
     generator.load_state_dict(ckpt["generator"])
     generator.eval()
@@ -66,7 +68,7 @@ def load_checkpoint(
 
     seq_head = None
     if "seq_head" in ckpt:
-        seq_head = SeqHead(s_s_dim=1024).to(device)
+        seq_head = SeqHead(s_s_dim=cfg.s_s_dim).to(device)
         seq_head.load_state_dict(ckpt["seq_head"])
         seq_head.eval()
         log.info("Loaded seq_head from checkpoint.")
@@ -234,6 +236,7 @@ def decode_and_evaluate(
     nearest_indices: list[int],
     device: torch.device,
     save_dir: str | None = None,
+    cheap_decoder=None,
 ) -> dict:
     """Decode generated embeddings and compute structure metrics.
 
@@ -241,6 +244,10 @@ def decode_and_evaluate(
       - pLDDT / pTM per sample
       - Pairwise TM-score between all generated samples (diversity)
       - TM-score of each generated sample to its nearest training protein (novelty)
+
+    Args:
+        cheap_decoder: Optional CheapDecoder instance. If provided, gen_samples
+            are treated as CHEAP z [L, 32] and decoded to s_s [L, 1024] first.
     """
     from esm_drift.utils import StructureDecoder
     decoder = StructureDecoder(device=str(device))
@@ -252,11 +259,17 @@ def decode_and_evaluate(
     gen_ca_list, gen_seq_list = [], []
 
     # --- Decode all generated samples ---
-    for i, (s_s, L) in enumerate(zip(gen_samples, lengths)):
+    for i, (emb, L) in enumerate(zip(gen_samples, lengths)):
         # Use seq_head prediction if available; fall back to poly-alanine
         seq = gen_seqs[i] if gen_seqs[i] is not None else "A" * L
         try:
-            struct = decoder.decode(s_s[:L], s_z=None, sequence=seq)
+            if cheap_decoder is not None:
+                # z [L, 32] → s_s [1, L, 1024]
+                mask_i = torch.ones(1, L, dtype=torch.bool, device=device)
+                s_s = cheap_decoder.z_to_s_s(emb[:L].unsqueeze(0).to(device), mask_i).squeeze(0)
+            else:
+                s_s = emb[:L]
+            struct = decoder.decode(s_s, s_z=None, sequence=seq)
             plddt = struct["plddt"].mean().item()
             ptm = struct["ptm"].item()
             gen_plddts.append(plddt)
@@ -323,9 +336,18 @@ def decode_and_evaluate(
         if set(real_seq) == {"X"}:
             real_seq = "A" * real["seq_len"]
         try:
-            real_struct = decoder.decode(real["s_s"], s_z=real.get("s_z"), sequence=real_seq)
-            real_ca = extract_ca_coords(real_struct)[:real["seq_len"]]
-            real_seq_trunc = real_seq[:real["seq_len"]]
+            real_emb = real["s_s"]  # [L, emb_dim] — may be z [L, 32] or s_s [L, 1024]
+            real_L = real["seq_len"]
+            if cheap_decoder is not None:
+                mask_r = torch.ones(1, real_L, dtype=torch.bool, device=device)
+                real_s_s_decoded = cheap_decoder.z_to_s_s(
+                    real_emb[:real_L].unsqueeze(0).to(device), mask_r
+                ).squeeze(0)
+            else:
+                real_s_s_decoded = real_emb[:real_L]
+            real_struct = decoder.decode(real_s_s_decoded, s_z=None, sequence=real_seq)
+            real_ca = extract_ca_coords(real_struct)[:real_L]
+            real_seq_trunc = real_seq[:real_L]
 
             # Compare at the shorter length
             L_cmp = min(len(gen_ca_list[i]), len(real_ca))
@@ -423,12 +445,19 @@ def main():
         log.info("Skipping ESMFold decode (--skip_decode)")
         return
 
+    # Load CheapDecoder if the checkpoint used CHEAP latents
+    cheap_decoder = None
+    if cfg.s_s_dim != 1024:
+        from esm_drift.utils import CheapDecoder
+        log.info("Loading CheapDecoder (s_s_dim=%d, model=%s)...", cfg.s_s_dim, cfg.cheap_model)
+        cheap_decoder = CheapDecoder(device=str(device))
+
     # Structure metrics
     real_data = [dataset[i] for i in range(len(dataset))]
     log.info("Decoding with ESMFold...")
     struct_metrics = decode_and_evaluate(
         gen_samples, gen_seqs, lengths, real_data, nearest_indices,
-        device, save_dir=args.save_pdbs,
+        device, save_dir=args.save_pdbs, cheap_decoder=cheap_decoder,
     )
 
     log.info("═" * 60)

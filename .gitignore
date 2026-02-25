@@ -212,3 +212,4 @@ data/*.pt
 checkpoints/*
 output/*
 wandb/*
+data/cheap/*
