@@ -1,0 +1,62 @@
+# v15-cheap64: CHEAP 64D latent space, 4×A6000, large dataset
+# Generator operates in z [L, 64] — better reconstruction ceiling than 32D
+# Data: data/cheap64/ (run scripts/encode_cheap.py --s_s_dim 64 --min_ptm 0.7 first)
+#
+# Launch:
+#   torchrun --nproc_per_node=4 scripts/train.py --config configs/v15-cheap64.yaml
+#
+# Run calibration first to update output_scale_init / protein_cond_std:
+#   uv run python scripts/encode_cheap.py --input_dir data/ --output_dir data/cheap64/ \
+#       --s_s_dim 64 --min_ptm 0.7
+#   uv run python scripts/encode_cheap.py --input_dir data/ --s_s_dim 64 --calibrate
+data_dir: data/cheap64/
+min_ptm: 0.7
+
+# CHEAP 64D settings
+s_s_dim: 64
+cheap_model: shorten_1_dim_64
+# Calibrated from encode_cheap.py --calibrate (update these after running calibration):
+#   gen_norm at scale=10 for 64D ≈ 57 * sqrt(64/32) = 80.6
+#   output_scale_init = 10 * real_norm / 80.6   (real_norm from --calibrate output)
+#   protein_cond_std  = 0.4 * real_prot_L2 / 65 (real_prot_L2 from --calibrate output)
+output_scale_init: 0.26
+protein_cond_std: 0.0025
+
+# Model architecture (same as v14, proven)
+d_noise: 256
+d_model: 512
+d_bottleneck: 128
+nhead: 8
+num_layers: 4
+max_len: 256
+use_length_cond: true
+
+# Training — 4×A6000: effective batch = 128 × 4 GPUs = 512
+epochs: 50000
+batch_size: 128
+lr: 3.0e-4
+max_grad_norm: 2.0
+eta_min: 1.0e-5
+eval_every: 500
+
+# LR schedule
+warmup_T0: 5000
+warmup_T_mult: 2
+
+# Kernel (auto-calibrate from CHEAP 64D distribution)
+taus: null
+tau_recal_every: 2000
+
+# Loss weights
+seq_ce_weight: 0.05
+prot_drift_weight: 0.5
+norm_loss_weight: 20
+max_drift_residues: 16384  # cap cdist input: 16384² × 4B = 4GB peak per tau, safe on 50GB
+use_strict_antisymmetry: true
+use_dynamic_len: true
+
+# Infrastructure
+device: cuda
+save_dir: checkpoints/v15-cheap64
+wandb_project: esm-drift
+wandb_name: v15-cheap64

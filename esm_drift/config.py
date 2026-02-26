@@ -31,6 +31,7 @@ class Config:
 
     # ── Data ──────────────────────────────────────────────────────────────────
     data_dir: str = "data/"
+    min_ptm: float = 0.0         # skip proteins with ESMFold pTM below this
 
     # ── Model architecture ────────────────────────────────────────────────────
     d_noise: int = 256
@@ -61,6 +62,7 @@ class Config:
     seq_ce_weight: float = 0.05
     prot_drift_weight: float = 0.5   # 0.0 = disabled
     norm_loss_weight: float = 200.0  # weight on norm-matching loss
+    max_drift_residues: int = 0      # cap residues per drifting call (0=no cap); prevents OOM at large batch×len
 
     # ── Ablation flags ────────────────────────────────────────────────────────
     use_strict_antisymmetry: bool = True

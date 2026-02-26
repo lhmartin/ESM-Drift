@@ -39,8 +39,13 @@ class CheapDecoder:
             return
         from cheap.pretrained import load_model_from_id
         from cheap.constants import CATH_COMPRESS_LEVEL_TO_ID
-        model_id = CATH_COMPRESS_LEVEL_TO_ID[1][32]
-        log.info("Loading CHEAP hourglass model (id=%s)...", model_id)
+        # Parse dim from model_name: "shorten_1_dim_32" → 32, "shorten_1_dim_64" → 64
+        try:
+            dim = int(self.model_name.split("_dim_")[-1])
+        except (ValueError, IndexError):
+            dim = 32
+        model_id = CATH_COMPRESS_LEVEL_TO_ID[1][dim]
+        log.info("Loading CHEAP hourglass model (id=%s, dim=%d)...", model_id, dim)
         self._model = load_model_from_id(model_id, infer_mode=True).to(self.device)
         log.info("CHEAP loaded.")
 

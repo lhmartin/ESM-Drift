@@ -1,30 +1,29 @@
 #!/usr/bin/env python3
 """Training script for ESM-Drift (per-residue drifting, no feature encoder).
 
-Trains a DriftingGeneratorUNet that maps noise → ESMFold s_s embeddings.
+Trains a DriftingGeneratorUNet that maps noise → ESMFold s_s / CHEAP z embeddings.
 
-Usage:
-    # Start from defaults
-    uv run python scripts/train.py --save_dir checkpoints/v14
+Single-GPU:
+    uv run python scripts/train.py --config configs/v14-cheap.yaml
 
-    # Load a config file
-    uv run python scripts/train.py --config configs/v14.yaml
+Multi-GPU (torchrun):
+    torchrun --nproc_per_node=4 scripts/train.py --config configs/v15-cheap64.yaml
 
-    # Load a config file and override specific fields
-    uv run python scripts/train.py --config configs/v14.yaml --lr 1e-3 --wandb_name v14-hi-lr
-
-    # Quick ablation: disable a feature
-    uv run python scripts/train.py --config configs/v14.yaml --no_use_length_cond
+Override specific fields:
+    torchrun --nproc_per_node=4 scripts/train.py --config configs/v15.yaml --lr 1e-3
 """
 
 import argparse
 import logging
+import os
 from functools import partial
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 import wandb
@@ -43,17 +42,29 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 log = logging.getLogger(__name__)
 
 
+def setup_ddp() -> tuple[int, int, bool]:
+    """Initialize DDP if running under torchrun. Returns (local_rank, world_size, is_main)."""
+    if "LOCAL_RANK" not in os.environ:
+        return 0, 1, True
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    dist.init_process_group(backend="nccl")
+    world_size = dist.get_world_size()
+    is_main = (local_rank == 0)
+    return local_rank, world_size, is_main
+
+
 def load_real_residues(
     dataset: EmbeddingDataset, max_len: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Load all real data into GPU memory.
 
     Returns:
-        real_residues: [n_total_valid, 1024] flattened valid residues
-        real_s_s:      [N, max_len, 1024] padded protein embeddings
+        real_residues: [n_total_valid, s_s_dim] flattened valid residues
+        real_s_s:      [N, max_len, s_s_dim] padded protein embeddings
         real_aa:       [N, max_len] LongTensor amino acid indices (0-19, 20=unk)
         real_mask:     [N, max_len] boolean mask
-        real_means:    [N, 1024] per-protein mean-pooled embeddings
+        real_means:    [N, s_s_dim] per-protein mean-pooled embeddings
         real_seq_lens: [N] actual sequence lengths (for dynamic batching)
     """
     collate = partial(pad_collate, max_len=max_len)
@@ -64,8 +75,8 @@ def load_real_residues(
     real_aa = batch["aa_indices"].to(device)
     real_seq_lens = batch["seq_lens"].to(device)
 
-    real_residues = real_s_s[real_mask]  # [n_valid, 1024]
-    real_means = masked_mean_pool(real_s_s, real_mask)  # [N, 1024]
+    real_residues = real_s_s[real_mask]  # [n_valid, s_s_dim]
+    real_means = masked_mean_pool(real_s_s, real_mask)  # [N, s_s_dim]
 
     log.info(
         "Real data: %d proteins, %d total residues, padded to L=%d",
@@ -94,7 +105,7 @@ def load_real_residues(
 
 
 def train(
-    generator: DriftingGeneratorUNet,
+    generator: nn.Module,
     real_residues: torch.Tensor,
     real_s_s: torch.Tensor,
     real_aa: torch.Tensor,
@@ -103,31 +114,37 @@ def train(
     real_seq_lens: torch.Tensor,
     cfg: Config,
     device: torch.device,
+    is_main: bool,
 ):
     """Train the drifting generator. All hyperparameters come from cfg."""
     save_path = Path(cfg.save_dir)
-    save_path.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        save_path.mkdir(parents=True, exist_ok=True)
+
+    # Unwrapped generator for attribute access and saving
+    raw_gen = generator.module if isinstance(generator, DDP) else generator
 
     n_proteins = real_s_s.shape[0]
     real_mean_norm = real_residues.norm(dim=-1).mean()
 
-    taus = list(cfg.taus) if cfg.taus else adaptive_taus(real_residues, multipliers=(0.5, 1.0, 2.0))
+    taus = list(cfg.taus) if cfg.taus else adaptive_taus(real_residues[:2000], multipliers=(0.5, 1.0, 2.0))
 
-    log.info(
-        "Training: %d epochs, batch=%d, lr=%s, taus=%s",
-        cfg.epochs, cfg.batch_size, cfg.lr, [f"{t:.1f}" for t in taus],
-    )
-    log.info("  warmup_T0=%d  T_mult=%d  prot_drift_weight=%.2f",
-             cfg.warmup_T0, cfg.warmup_T_mult, cfg.prot_drift_weight)
-    log.info("  use_length_cond=%s  use_strict_antisymmetry=%s  use_dynamic_len=%s",
-             generator.use_length_cond, cfg.use_strict_antisymmetry, cfg.use_dynamic_len)
+    if is_main:
+        log.info(
+            "Training: %d epochs, batch=%d, lr=%s, taus=%s",
+            cfg.epochs, cfg.batch_size, cfg.lr, [f"{t:.1f}" for t in taus],
+        )
+        log.info("  warmup_T0=%d  T_mult=%d  prot_drift_weight=%.2f",
+                 cfg.warmup_T0, cfg.warmup_T_mult, cfg.prot_drift_weight)
+        log.info("  use_length_cond=%s  use_strict_antisymmetry=%s  use_dynamic_len=%s",
+                 raw_gen.use_length_cond, cfg.use_strict_antisymmetry, cfg.use_dynamic_len)
 
     seq_head = SeqHead(s_s_dim=cfg.s_s_dim).to(device)
     generator.train()
     seq_head.train()
 
     optimizer = torch.optim.AdamW(
-        list(generator.parameters()) + list(seq_head.parameters()),
+        list(raw_gen.parameters()) + list(seq_head.parameters()),
         lr=cfg.lr, weight_decay=1e-4,
     )
     if cfg.warmup_T0 > 0:
@@ -143,7 +160,7 @@ def train(
 
     def _save(epoch: int, loss_val: float, filename: str):
         torch.save({
-            "generator": generator.state_dict(),
+            "generator": raw_gen.state_dict(),
             "seq_head": seq_head.state_dict(),
             "epoch": epoch,
             "loss": loss_val,
@@ -151,7 +168,7 @@ def train(
         }, save_path / filename)
 
     for epoch in range(1, cfg.epochs + 1):
-        # Sample B real proteins, generate at their actual max length (no wasted padding)
+        # Each rank independently samples a different random batch — gradients are averaged via DDP
         if n_proteins >= cfg.batch_size:
             prot_idx = torch.randperm(n_proteins, device=device)[:cfg.batch_size]
         else:
@@ -165,15 +182,15 @@ def train(
         gen_mask  = torch.ones(cfg.batch_size, L_batch, dtype=torch.bool, device=device)
         prot_lens = real_seq_lens[prot_idx]  # [B] for length conditioning
 
-        noise     = generator.sample_noise(cfg.batch_size, L_batch, device)
-        z_protein = torch.randn(cfg.batch_size, 1, generator.d_noise, device=device)
+        noise     = raw_gen.sample_noise(cfg.batch_size, L_batch, device)
+        z_protein = torch.randn(cfg.batch_size, 1, raw_gen.d_noise, device=device)
         noise     = noise + z_protein
-        gen_s_s   = generator(noise, gen_mask, lengths=prot_lens)  # [B, L_batch, 1024]
+        gen_s_s   = generator(noise, gen_mask, lengths=prot_lens)  # [B, L_batch, s_s_dim]
 
         gen_residues = gen_s_s.reshape(-1, cfg.s_s_dim)  # [B*L_batch, s_s_dim]
-        prot_s_s     = real_s_s[prot_idx, :L_batch, :]   # [B, L_batch, 1024]
+        prot_s_s     = real_s_s[prot_idx, :L_batch, :]   # [B, L_batch, s_s_dim]
         prot_mask    = real_mask[prot_idx, :L_batch]      # [B, L_batch]
-        pos_residues = prot_s_s[prot_mask]                # [n_valid, 1024]
+        pos_residues = prot_s_s[prot_mask]                # [n_valid, s_s_dim]
 
         # Strict anti-symmetry: paper requires N_pos == N_neg
         if cfg.use_strict_antisymmetry:
@@ -184,6 +201,15 @@ def train(
                 gen_for_drift = gen_residues
         else:
             gen_for_drift = gen_residues
+
+        # Cap residues fed to cdist to prevent OOM at large batch×len
+        if cfg.max_drift_residues > 0:
+            n_cap = cfg.max_drift_residues
+            if gen_for_drift.shape[0] > n_cap:
+                gen_for_drift = gen_for_drift[torch.randperm(gen_for_drift.shape[0], device=device)[:n_cap]]
+            if pos_residues.shape[0] > n_cap:
+                pos_residues = pos_residues[torch.randperm(pos_residues.shape[0], device=device)[:n_cap]]
+
         drift_loss = multi_tau_drifting_loss(gen_for_drift, pos_residues, taus)
 
         # Protein-level drifting on unit-sphere mean-pooled embeddings
@@ -219,25 +245,26 @@ def train(
         optimizer.zero_grad()
         loss.backward()
         grad_norm = nn.utils.clip_grad_norm_(
-            list(generator.parameters()) + list(seq_head.parameters()),
+            list(raw_gen.parameters()) + list(seq_head.parameters()),
             max_norm=cfg.max_grad_norm,
         )
         optimizer.step()
         scheduler.step()
 
-        wandb.log({
-            "train/loss": loss.item(),
-            "train/drift_loss": drift_loss.item(),
-            "train/prot_drift_loss": prot_drift_loss.item(),
-            "train/norm_loss": norm_loss.item(),
-            "train/gen_ce_loss": gen_ce_loss.item(),
-            "train/real_ce_loss": real_ce_loss.item(),
-            "train/grad_norm": grad_norm.item(),
-            "train/lr": scheduler.get_last_lr()[0],
-            "train/epoch": epoch,
-        })
+        if is_main:
+            wandb.log({
+                "train/loss": loss.item(),
+                "train/drift_loss": drift_loss.item(),
+                "train/prot_drift_loss": prot_drift_loss.item(),
+                "train/norm_loss": norm_loss.item(),
+                "train/gen_ce_loss": gen_ce_loss.item(),
+                "train/real_ce_loss": real_ce_loss.item(),
+                "train/grad_norm": grad_norm.item(),
+                "train/lr": scheduler.get_last_lr()[0],
+                "train/epoch": epoch,
+            })
 
-        if epoch % cfg.eval_every == 0:
+        if is_main and epoch % cfg.eval_every == 0:
             with torch.no_grad():
                 cross = torch.cdist(gen_residues[:200], real_residues[:200])
                 mean_dist = cross.mean().item()
@@ -249,7 +276,7 @@ def train(
                 gen_std     = gen_residues.std(dim=0).mean().item()
                 real_std    = real_residues.std(dim=0).mean().item()
 
-                gen_means      = masked_mean_pool(gen_s_s, gen_mask)  # [B, 1024]
+                gen_means      = masked_mean_pool(gen_s_s, gen_mask)  # [B, s_s_dim]
                 off_diag       = ~torch.eye(cfg.batch_size, dtype=torch.bool, device=device)
                 gen_pairwise   = torch.cdist(gen_means, gen_means)[off_diag].mean().item()
                 real_pairwise  = torch.cdist(real_means[prot_idx], real_means[prot_idx])[off_diag].mean().item()
@@ -264,8 +291,8 @@ def train(
 
             log.info(
                 "Epoch %d/%d  loss=%.4f (drift=%.4f prot=%.4f norm=%.4f gen_ce=%.4f)  "
-                "grad=%.4f  cos_sim=%.4f  gen_norm=%.0f  gen_std=%.2f  seq_acc=%.3f  "
-                "prot_L2=%.1f (real=%.1f)  unique=%d/%d  L=%d",
+                "grad=%.4f  cos_sim=%.4f  gen_norm=%.3f  gen_std=%.4f  seq_acc=%.3f  "
+                "prot_L2=%.3f (real=%.3f)  unique=%d/%d  L=%d",
                 epoch, cfg.epochs, loss.item(), drift_loss.item(),
                 prot_drift_loss.item(), norm_loss.item(), gen_ce_loss.item(),
                 grad_norm.item(), cos_sim, gen_norms.mean().item(), gen_std, seq_acc,
@@ -286,7 +313,8 @@ def train(
             })
 
             if cfg.tau_recal_every > 0 and epoch % cfg.tau_recal_every == 0:
-                taus = list(adaptive_taus(gen_residues.detach(), multipliers=(0.5, 1.0, 2.0)))
+                # Use a fixed slice of real residues for consistent tau calibration across ranks
+                taus = list(adaptive_taus(real_residues[:2000], multipliers=(0.5, 1.0, 2.0)))
                 log.info("  [tau recal @ %d]  %s", epoch, [f"{t:.3f}" for t in taus])
                 wandb.log({"train/tau_base": taus[1], "train/epoch": epoch})
 
@@ -294,8 +322,9 @@ def train(
                 best_loss = loss.item()
                 _save(epoch, best_loss, "best.pt")
 
-    _save(cfg.epochs, loss.item(), "final.pt")
-    log.info("Training complete. Best loss: %.6f", best_loss)
+    if is_main:
+        _save(cfg.epochs, loss.item(), "final.pt")
+        log.info("Training complete. Best loss: %.6f", best_loss)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -310,6 +339,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ── Data ──────────────────────────────────────────────────────────────────
     parser.add_argument("--data_dir", type=str, default=None)
+    parser.add_argument("--min_ptm", type=float, default=None)
 
     # ── Model ─────────────────────────────────────────────────────────────────
     parser.add_argument("--d_noise", type=int, default=None)
@@ -344,6 +374,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seq_ce_weight", type=float, default=None)
     parser.add_argument("--prot_drift_weight", type=float, default=None,
                         help="Weight for protein-level drifting loss. 0.0 = disabled.")
+    parser.add_argument("--norm_loss_weight", type=float, default=None)
+    parser.add_argument("--max_drift_residues", type=int, default=None)
     parser.add_argument("--use_strict_antisymmetry", action=argparse.BooleanOptionalAction, default=None,
                         help="Enforce N_pos==N_neg in drifting kernel.")
     parser.add_argument("--use_dynamic_len", action=argparse.BooleanOptionalAction, default=None,
@@ -360,6 +392,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main():
+    local_rank, world_size, is_main = setup_ddp()
+
     parser = build_parser()
     args = parser.parse_args()
 
@@ -371,25 +405,30 @@ def main():
         if hasattr(cfg, key):
             setattr(cfg, key, val)
 
-    # Resolve device default
-    if cfg.device == "cuda" and not torch.cuda.is_available():
-        cfg.device = "cpu"
-    device = torch.device(cfg.device)
+    # Resolve device: torchrun sets LOCAL_RANK, use that GPU; otherwise use cfg.device
+    if world_size > 1:
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+    else:
+        if cfg.device == "cuda" and not torch.cuda.is_available():
+            cfg.device = "cpu"
+        device = torch.device(cfg.device)
 
-    # max_len alias: train.py historically used --max_seq_len; Config uses max_len
-    if wandb is not None:
+    if is_main:
         if args.no_wandb:
             wandb.init(mode="disabled")
         else:
             wandb.init(project=cfg.wandb_project, name=cfg.wandb_name, config=cfg.to_dict())
 
-    # Save config snapshot alongside the checkpoints
-    cfg.save_yaml(Path(cfg.save_dir) / "config.yaml")
-    log.info("Config saved to %s/config.yaml", cfg.save_dir)
-    log.info("Config: %s", cfg.to_dict())
+        # Save config snapshot alongside the checkpoints
+        cfg.save_yaml(Path(cfg.save_dir) / "config.yaml")
+        log.info("Config saved to %s/config.yaml", cfg.save_dir)
+        log.info("Config: %s", cfg.to_dict())
 
-    dataset = EmbeddingDataset(cfg.data_dir, max_seq_len=cfg.max_len)
-    log.info("Dataset: %d samples, max_len=%d", len(dataset), cfg.max_len)
+    dataset = EmbeddingDataset(cfg.data_dir, max_seq_len=cfg.max_len, min_ptm=cfg.min_ptm)
+    if is_main:
+        log.info("Dataset: %d samples, max_len=%d, min_ptm=%.2f",
+                 len(dataset), cfg.max_len, cfg.min_ptm)
     if len(dataset) == 0:
         log.error("No samples found in %s", cfg.data_dir)
         return
@@ -411,14 +450,25 @@ def main():
         protein_cond_std=cfg.protein_cond_std,
     ).to(device)
 
-    n_params = sum(p.numel() for p in generator.parameters())
-    log.info("Generator: %d params (%.1fM)", n_params, n_params / 1e6)
+    if world_size > 1:
+        generator = DDP(generator, device_ids=[local_rank])
+
+    if is_main:
+        raw_gen = generator.module if isinstance(generator, DDP) else generator
+        n_params = sum(p.numel() for p in raw_gen.parameters())
+        log.info("Generator: %d params (%.1fM)", n_params, n_params / 1e6)
+        log.info("World size: %d GPU(s)", world_size)
 
     train(
         generator, real_residues, real_s_s, real_aa, real_mask, real_means, real_seq_lens,
-        cfg=cfg, device=device,
+        cfg=cfg, device=device, is_main=is_main,
     )
-    wandb.finish()
+
+    if is_main:
+        wandb.finish()
+
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -64,11 +64,11 @@ def unscale(z_norm: torch.Tensor, chan_min: torch.Tensor, chan_max: torch.Tensor
     return (z_norm + 1.0) / 2.0 * denom + chan_min
 
 
-def load_cheap_model(device: torch.device):
+def load_cheap_model(device: torch.device, s_s_dim: int = 32):
     from cheap.pretrained import load_model_from_id
     from cheap.constants import CATH_COMPRESS_LEVEL_TO_ID
-    model_id = CATH_COMPRESS_LEVEL_TO_ID[1][32]
-    log.info("Loading CHEAP shorten_1_dim_32 (model_id=%s)...", model_id)
+    model_id = CATH_COMPRESS_LEVEL_TO_ID[1][s_s_dim]
+    log.info("Loading CHEAP shorten_1_dim_%d (model_id=%s)...", s_s_dim, model_id)
     model = load_model_from_id(model_id, infer_mode=True).to(device)
     return model
 
@@ -150,21 +150,62 @@ def run_test(input_dir: Path, model, chan_min, chan_max, device):
         print(f"  {f.name}: L={L}  pLDDT orig={plddt_orig:.3f}  recon={plddt_recon:.3f}  delta={plddt_recon - plddt_orig:+.3f}")
 
 
+def print_calibration(input_dir: Path, model, chan_min, chan_max, device, s_s_dim: int):
+    """Encode a sample of proteins and print suggested training calibration values."""
+    import math
+    files = sorted(input_dir.glob("*.pt"))
+    files = [f for f in files if torch.load(f, map_location="cpu", weights_only=False).get("s_s") is not None][:100]
+    norms, prot_l2s = [], []
+    for f in files:
+        d = torch.load(f, map_location="cpu", weights_only=False)
+        s_s = d["s_s"].unsqueeze(0).to(device)
+        L = s_s.shape[1]
+        mask = torch.ones(1, L, dtype=torch.bool, device=device)
+        s_s_scaled = scale(s_s, chan_min, chan_max)
+        with torch.no_grad():
+            z, _ = model.enc(s_s_scaled, mask)
+        z = z.squeeze(0)
+        norms.extend(z.norm(dim=-1).tolist())
+        prot_l2s.append(z.mean(dim=0).norm().item())
+    real_norm = sum(norms) / len(norms)
+    real_prot_l2 = sum(prot_l2s) / len(prot_l2s)
+    # At default output_scale=10, gen_norm scales with sqrt(s_s_dim) relative to 32D baseline
+    # Empirically: gen_norm_32D ≈ 57. For 64D: ≈57*sqrt(64/32)=80.6
+    gen_norm_est = 57.0 * math.sqrt(s_s_dim / 32)
+    output_scale_init = round(10.0 * real_norm / gen_norm_est, 4)
+    protein_cond_std = round(0.4 * real_prot_l2 / 65.0, 5)
+    log.info("=== CALIBRATION FOR v15 CONFIG ===")
+    log.info("  real z residue norm:  mean=%.3f  (from %d files)", real_norm, len(files))
+    log.info("  real prot_L2:         mean=%.3f", real_prot_l2)
+    log.info("  Suggested output_scale_init: %.4f", output_scale_init)
+    log.info("  Suggested protein_cond_std:  %.5f", protein_cond_std)
+    log.info("  (add these to your config yaml)")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Encode ESMFold s_s → CHEAP z [L, 32]")
+    parser = argparse.ArgumentParser(description="Encode ESMFold s_s → CHEAP z")
     parser.add_argument("--input_dir", type=str, default="data/")
     parser.add_argument("--output_dir", type=str, default="data/cheap/")
+    parser.add_argument("--s_s_dim", type=int, default=32, choices=[4,8,16,32,64,128,256,512],
+                        help="CHEAP latent dimension (shorten_1_dim_{s_s_dim})")
     parser.add_argument("--max_len", type=int, default=512, help="Skip proteins longer than this")
+    parser.add_argument("--min_ptm", type=float, default=0.0, help="Skip proteins with pTM below this")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--test", action="store_true", help="Run reconstruction quality test only")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Encode a sample and print suggested output_scale_init / protein_cond_std")
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    model = load_cheap_model(device)
+    model = load_cheap_model(device, s_s_dim=args.s_s_dim)
     chan_min, chan_max = compute_channel_stats(input_dir)
+
+    if args.calibrate:
+        print_calibration(input_dir, model, chan_min, chan_max, device, s_s_dim=args.s_s_dim)
+        return
 
     if args.test:
         run_test(input_dir, model, chan_min, chan_max, device)
@@ -178,7 +219,8 @@ def main():
     log.info("Saved normalisation stats to %s", stats_path)
 
     files = sorted(input_dir.glob("*.pt"))
-    log.info("Encoding %d files from %s → %s", len(files), input_dir, output_dir)
+    log.info("Encoding %d files from %s → %s (s_s_dim=%d, min_ptm=%.2f)",
+             len(files), input_dir, output_dir, args.s_s_dim, args.min_ptm)
 
     n_ok, n_skip = 0, 0
     for i, f in enumerate(files):
@@ -186,6 +228,16 @@ def main():
         if out_path.exists():
             n_ok += 1
             continue
+
+        # Quality filter: skip low-confidence structures before encoding
+        if args.min_ptm > 0.0:
+            try:
+                d_meta = torch.load(f, map_location="cpu", weights_only=False)
+                if d_meta.get("ptm", 1.0) < args.min_ptm:
+                    n_skip += 1
+                    continue
+            except Exception:
+                pass
 
         result = encode_file(f, model, chan_min, chan_max, device, max_len=args.max_len)
         if result is None:
