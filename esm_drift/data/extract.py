@@ -104,8 +104,12 @@ def sequence_from_structure(filepath: Path, chain_id: str | None = None) -> list
                 residues.append("X")
 
         seq = "".join(residues)
-        if len(seq) >= 10:  # skip very short fragments
-            results.append((chain.id, seq))
+        if len(seq) < 10:  # skip very short fragments
+            continue
+        # Skip DNA/RNA chains (nucleotides map to "X"; >50% X means non-protein)
+        if seq.count("X") / len(seq) > 0.5:
+            continue
+        results.append((chain.id, seq))
 
     return results
 
@@ -190,7 +194,7 @@ class EmbeddingExtractor:
             L = len(seq)
             s_s = outputs.s_s[i, :L].cpu()        # [L, 1024]
             s_z = outputs.s_z[i, :L, :L].cpu()    # [L, L, 128]
-            plddt = outputs.plddt[i, :L, 0].cpu() # [L]
+            plddt = outputs.plddt[i, :L, 0].cpu() * 100  # [L], scale to 0-100
             # ptm shape varies: scalar when batch=1, [B] otherwise
             ptm_t = outputs.ptm
             ptm = ptm_t[i].item() if ptm_t.dim() > 0 and ptm_t.shape[0] > 1 else ptm_t.item()
@@ -232,12 +236,11 @@ class EmbeddingExtractor:
         result = self.extract(sequence)
 
         data = {
-            "s_s": result["s_s"],
-            "s_z": result["s_z"],
+            "s_s": result["s_s"].half(),
             "sequence": sequence,
             "source_file": source_file,
             "chain_id": chain_id,
-            "plddt": result["plddt"],
+            "plddt": result["plddt"].half(),
             "ptm": result["ptm"],
             "seq_len": len(sequence),
         }
@@ -301,12 +304,11 @@ def process_structure_file(
             continue
 
         data = {
-            "s_s": result["s_s"],
-            "s_z": result["s_z"],
+            "s_s": result["s_s"].half(),
             "sequence": seq,
             "source_file": str(filepath),
             "chain_id": cid,
-            "plddt": result["plddt"],
+            "plddt": result["plddt"].half(),
             "ptm": result["ptm"],
             "seq_len": len(seq),
         }
