@@ -113,11 +113,11 @@ def run_batch(
             skipped += 1
             continue
         data = {
-            "s_s": result["s_s"].half(),
+            "s_s": result["s_s"],
             "sequence": seq,
             "source_file": str(filepath),
             "chain_id": cid,
-            "plddt": result["plddt"].half(),
+            "plddt": result["plddt"],
             "ptm": result["ptm"],
             "seq_len": len(seq),
         }

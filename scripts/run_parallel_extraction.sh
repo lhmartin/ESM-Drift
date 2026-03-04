@@ -15,7 +15,7 @@ OUTPUT_DIR="${2:-$HOME/data/esm_fold_embeddings}"
 WORLD_SIZE=4
 MAX_SEQ_LEN=512
 MIN_PLDDT=70.0
-BATCH_SIZE=16  # sequences per GPU forward pass; reduce if OOM
+BATCH_SIZE=4   # fp16 via autocast; pTM patch handles NaN in batched inference
 
 mkdir -p logs "$OUTPUT_DIR"
 

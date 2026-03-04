@@ -12,8 +12,9 @@ import torch
 from Bio.PDB import MMCIFParser, PDBParser
 
 
-
 log = logging.getLogger(__name__)
+
+
 
 # Standard amino acids that ESMFold understands
 STANDARD_AA = set("ACDEFGHIKLMNPQRSTVWY")
@@ -186,8 +187,7 @@ class EmbeddingExtractor:
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        with torch.autocast(device_type=self.device.type, dtype=torch.float16):
-            outputs = self._model(**inputs)
+        outputs = self._model(**inputs)
 
         results = []
         for i, seq in enumerate(sequences):
@@ -236,11 +236,11 @@ class EmbeddingExtractor:
         result = self.extract(sequence)
 
         data = {
-            "s_s": result["s_s"].half(),
+            "s_s": result["s_s"],
             "sequence": sequence,
             "source_file": source_file,
             "chain_id": chain_id,
-            "plddt": result["plddt"].half(),
+            "plddt": result["plddt"],
             "ptm": result["ptm"],
             "seq_len": len(sequence),
         }
@@ -304,11 +304,11 @@ def process_structure_file(
             continue
 
         data = {
-            "s_s": result["s_s"].half(),
+            "s_s": result["s_s"],
             "sequence": seq,
             "source_file": str(filepath),
             "chain_id": cid,
-            "plddt": result["plddt"].half(),
+            "plddt": result["plddt"],
             "ptm": result["ptm"],
             "seq_len": len(seq),
         }
